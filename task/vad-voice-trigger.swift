@@ -317,17 +317,30 @@ private func inputChannelCount(_ deviceID: AudioDeviceID) throws -> UInt32 {
         mScope: kAudioObjectPropertyScopeInput,
         mElement: kAudioObjectPropertyElementMain
     )
+    guard AudioObjectHasProperty(deviceID, &address) else {
+        return 0
+    }
+
     var size: UInt32 = 0
     var status = AudioObjectGetPropertyDataSize(deviceID, &address, 0, nil, &size)
-    guard status == noErr, size >= MemoryLayout<AudioBufferList>.size else {
+    guard status == noErr else {
         throw UserError("Unable to inspect audio device \(deviceID) inputs (CoreAudio \(coreAudioStatus(status))).")
     }
 
+    // AudioBufferList has a variable-length trailing buffer array. CoreAudio
+    // may legitimately report only the mNumberBuffers field for an output-only
+    // device, which is smaller than Swift's fixed AudioBufferList layout.
+    // Treat an empty/short list as zero input channels instead of aborting the
+    // enumeration of every device (the former code produced "CoreAudio 0").
+    guard size >= MemoryLayout<UInt32>.size else { return 0 }
+
+    let allocationSize = max(Int(size), MemoryLayout<AudioBufferList>.size)
     let rawBuffer = UnsafeMutableRawPointer.allocate(
-        byteCount: Int(size),
+        byteCount: allocationSize,
         alignment: MemoryLayout<AudioBufferList>.alignment
     )
     defer { rawBuffer.deallocate() }
+    rawBuffer.initializeMemory(as: UInt8.self, repeating: 0, count: allocationSize)
 
     status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, rawBuffer)
     guard status == noErr else {
@@ -359,6 +372,7 @@ private func audioInputDevices() throws -> [AudioInputDevice] {
     }
 
     let count = Int(size) / MemoryLayout<AudioDeviceID>.size
+    guard count > 0 else { return [] }
     var deviceIDs = [AudioDeviceID](repeating: 0, count: count)
     status = deviceIDs.withUnsafeMutableBytes { bytes in
         AudioObjectGetPropertyData(
@@ -375,15 +389,22 @@ private func audioInputDevices() throws -> [AudioInputDevice] {
     }
 
     let defaultID = try? systemDefaultInputDeviceID()
-    return try deviceIDs.compactMap { deviceID in
-        let channels = try inputChannelCount(deviceID)
-        guard channels > 0 else { return nil }
-        return AudioInputDevice(
-            id: deviceID,
-            name: try audioDeviceName(deviceID),
-            inputChannels: channels,
-            isSystemDefault: deviceID == defaultID
-        )
+    return deviceIDs.compactMap { deviceID in
+        do {
+            let channels = try inputChannelCount(deviceID)
+            guard channels > 0 else { return nil }
+            return AudioInputDevice(
+                id: deviceID,
+                name: try audioDeviceName(deviceID),
+                inputChannels: channels,
+                isSystemDefault: deviceID == defaultID
+            )
+        } catch {
+            // A stale/virtual device must not hide otherwise valid inputs such
+            // as Wireless Mic Rx. Keep enumerating and expose the skipped ID.
+            fputs("WARNING: Skipping audio device \(deviceID): \(error)\n", stderr)
+            return nil
+        }
     }.sorted {
         $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
     }
