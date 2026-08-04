@@ -11,6 +11,9 @@
    configured maximum recording time.
  - Uses an energy-based VAD with separate start/stop thresholds, hysteresis,
    sustained-speech confirmation, cooldown debounce, and a timeout failsafe.
+ - Retains the recording state and retries if a stop event cannot be created.
+ - If audio callbacks disappear for 1.5 seconds (for example, the receiver is
+   unplugged), attempts a final stop and exits with an explicit error.
 
  Configure Doubao Input Method before running
  --------------------------------------------
@@ -41,6 +44,7 @@
  -----------------------------
    ./task/vad-voice-trigger --self-test
    ./task/vad-voice-trigger --dry-run --device "Wireless Mic Rx"
+   ./task/vad-voice-trigger --dry-run --simulate-vad
    ./task/vad-voice-trigger --threshold-db -42 --silence-ms 1000
    ./task/vad-voice-trigger --default-input
 
@@ -48,6 +52,7 @@
  posted. Press Control-C to stop. If room noise starts dictation, raise the
  threshold (for example, from -42 to -36). If normal speech is missed, lower
  it. Keep --silence-ms between 800 and 1200 as required by this workflow.
+ Use --dry-run --simulate-vad for a hardware-independent start-to-stop check.
 
  Permissions
  -----------
@@ -78,6 +83,8 @@ private let defaultDJIDeviceName = "Wireless Mic Rx"
 private let rightOptionKeyCode: CGKeyCode = 61
 private let minimumSilenceMilliseconds = 800.0
 private let maximumSilenceMilliseconds = 1_200.0
+private let audioWatchdogSeconds = 1.5
+private let stopRetrySeconds = 0.25
 
 private struct UserError: Error, CustomStringConvertible {
     let description: String
@@ -103,6 +110,7 @@ private struct Configuration {
     var dryRun = false
     var listDevices = false
     var selfTest = false
+    var simulateVAD = false
     var showHelp = false
 }
 
@@ -122,6 +130,7 @@ private func printUsage() {
           --cooldown-ms MS      Post-stop debounce window (default: 700 ms).
           --max-seconds SEC     Failsafe recording timeout (default: 120 s).
           --dry-run             Print VAD actions without sending Right Option.
+          --simulate-vad        With --dry-run, simulate speech then silence and exit.
           --self-test           Test VAD transitions without audio or permissions.
           --help                Show this help.
         """
@@ -205,6 +214,9 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
         case "--self-test":
             configuration.selfTest = true
             index += 1
+        case "--simulate-vad":
+            configuration.simulateVAD = true
+            index += 1
         case "--help", "-h":
             configuration.showHelp = true
             index += 1
@@ -231,6 +243,9 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
     }
     guard configuration.maxSessionSeconds > 0 else {
         throw UserError("--max-seconds must be greater than 0.")
+    }
+    guard !configuration.simulateVAD || configuration.dryRun else {
+        throw UserError("--simulate-vad must be used with --dry-run.")
     }
 
     return configuration
@@ -430,6 +445,7 @@ private struct VADDetector {
     private var silenceSeconds = 0.0
     private var activeStartedAt = 0.0
     private var cooldownUntil = 0.0
+    private(set) var pendingStopReason: String?
 
     init(
         startThresholdDB: Double,
@@ -451,6 +467,7 @@ private struct VADDetector {
         guard duration > 0 else { return nil }
 
         if isActive {
+            guard pendingStopReason == nil else { return nil }
             if let timeoutAction = checkTimeout(now: now) { return timeoutAction }
 
             if levelDB < stopThresholdDB {
@@ -460,7 +477,7 @@ private struct VADDetector {
             }
 
             if silenceSeconds >= requiredSilenceSeconds {
-                return stop(now: now, reason: "sustained silence")
+                return requestStop(reason: "sustained silence")
             }
             return nil
         }
@@ -485,13 +502,32 @@ private struct VADDetector {
     }
 
     mutating func checkTimeout(now: Double) -> VADAction? {
-        guard isActive, now - activeStartedAt >= maxSessionSeconds else { return nil }
-        return stop(now: now, reason: "maximum session timeout")
+        guard isActive,
+              pendingStopReason == nil,
+              now - activeStartedAt >= maxSessionSeconds else { return nil }
+        return requestStop(reason: "maximum session timeout")
     }
 
-    mutating func forceStop(now: Double, reason: String) -> VADAction? {
+    mutating func forceStop(reason: String) -> VADAction? {
         guard isActive else { return nil }
-        return stop(now: now, reason: reason)
+        if let pendingStopReason {
+            return .stop(reason: pendingStopReason)
+        }
+        return requestStop(reason: reason)
+    }
+
+    func retryPendingStop() -> VADAction? {
+        pendingStopReason.map { .stop(reason: $0) }
+    }
+
+    mutating func confirmStop(now: Double) {
+        guard isActive, pendingStopReason != nil else { return }
+        isActive = false
+        activeStartedAt = 0
+        speechSeconds = 0
+        silenceSeconds = 0
+        pendingStopReason = nil
+        cooldownUntil = now + cooldownSeconds
     }
 
     mutating func cancelFailedStart(now: Double) {
@@ -500,16 +536,46 @@ private struct VADDetector {
         activeStartedAt = 0
         speechSeconds = 0
         silenceSeconds = 0
+        pendingStopReason = nil
         cooldownUntil = now + cooldownSeconds
     }
 
-    private mutating func stop(now: Double, reason: String) -> VADAction {
-        isActive = false
-        activeStartedAt = 0
-        speechSeconds = 0
-        silenceSeconds = 0
-        cooldownUntil = now + cooldownSeconds
+    private mutating func requestStop(reason: String) -> VADAction {
+        pendingStopReason = reason
         return .stop(reason: reason)
+    }
+}
+
+private struct AudioCallbackWatchdog {
+    let timeoutSeconds: Double
+    private(set) var isMonitoring = false
+    private(set) var hasReportedStall = false
+    private var lastCallbackAt = 0.0
+
+    init(timeoutSeconds: Double) {
+        self.timeoutSeconds = timeoutSeconds
+    }
+
+    mutating func begin(now: Double) {
+        isMonitoring = true
+        hasReportedStall = false
+        lastCallbackAt = now
+    }
+
+    mutating func heartbeat(now: Double) {
+        lastCallbackAt = now
+    }
+
+    mutating func detectStall(now: Double) -> Bool {
+        guard isMonitoring,
+              !hasReportedStall,
+              now - lastCallbackAt >= timeoutSeconds else { return false }
+        hasReportedStall = true
+        return true
+    }
+
+    mutating func stop() {
+        isMonitoring = false
     }
 }
 
@@ -558,12 +624,19 @@ private final class RightOptionTapper: @unchecked Sendable {
 private final class VADController: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dji-mic-voice.vad")
     private let tapper: RightOptionTapper
+    private let onAudioStall: @Sendable (String) -> Void
     private var detector: VADDetector
+    private var audioWatchdog = AudioCallbackWatchdog(timeoutSeconds: audioWatchdogSeconds)
     private var lastMeterPrintAt = 0.0
-    private var timeoutTimer: DispatchSourceTimer?
+    private var lastStopAttemptAt = 0.0
+    private var safetyTimer: DispatchSourceTimer?
     private var isShuttingDown = false
 
-    init(configuration: Configuration, tapper: RightOptionTapper) {
+    init(
+        configuration: Configuration,
+        tapper: RightOptionTapper,
+        onAudioStall: @escaping @Sendable (String) -> Void
+    ) {
         detector = VADDetector(
             startThresholdDB: configuration.startThresholdDB,
             stopThresholdDB: configuration.stopThresholdDB,
@@ -573,22 +646,30 @@ private final class VADController: @unchecked Sendable {
             maxSessionSeconds: configuration.maxSessionSeconds
         )
         self.tapper = tapper
+        self.onAudioStall = onAudioStall
 
-        // This timer makes the maximum-session failsafe independent of audio
-        // callbacks, so a stalled input stream cannot leave dictation active.
+        // One timer owns stop retries, maximum-session checks, and the audio
+        // callback watchdog. It runs independently of AVAudioEngine callbacks.
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [weak self] in
-            self?.checkTimeout()
+            self?.checkSafety()
         }
         timer.resume()
-        timeoutTimer = timer
+        safetyTimer = timer
+    }
+
+    func beginAudioWatchdog() {
+        queue.sync { [self] in
+            audioWatchdog.begin(now: ProcessInfo.processInfo.systemUptime)
+        }
     }
 
     func accept(levelDB: Double, duration: Double) {
         let now = ProcessInfo.processInfo.systemUptime
         queue.async { [self] in
             guard !isShuttingDown else { return }
+            audioWatchdog.heartbeat(now: now)
             if now - lastMeterPrintAt >= 0.25 {
                 let state = detector.isActive ? "recording" : "waiting"
                 print(String(format: "[LEVEL] %6.1f dBFS  %@", levelDB, state))
@@ -604,19 +685,41 @@ private final class VADController: @unchecked Sendable {
     }
 
     func shutdown() {
-        timeoutTimer?.cancel()
-        timeoutTimer = nil
+        safetyTimer?.cancel()
+        safetyTimer = nil
         queue.sync { [self] in
             isShuttingDown = true
+            audioWatchdog.stop()
             let now = ProcessInfo.processInfo.systemUptime
-            if let action = detector.forceStop(now: now, reason: "program shutdown") {
+            if let action = detector.forceStop(reason: "program shutdown") {
                 handle(action, now: now)
             }
         }
     }
 
-    private func checkTimeout() {
+    private func checkSafety() {
+        guard !isShuttingDown else { return }
         let now = ProcessInfo.processInfo.systemUptime
+
+        if audioWatchdog.detectStall(now: now) {
+            let message = String(
+                format: "No audio callback for %.1f seconds; the input was disconnected or stalled.",
+                audioWatchdogSeconds
+            )
+            if let action = detector.forceStop(reason: "audio input stalled") {
+                handle(action, now: now)
+            }
+            fputs("ERROR: \(message)\n", stderr)
+            onAudioStall(message)
+            return
+        }
+
+        if now - lastStopAttemptAt >= stopRetrySeconds,
+           let action = detector.retryPendingStop() {
+            handle(action, now: now)
+            return
+        }
+
         if let action = detector.checkTimeout(now: now) {
             handle(action, now: now)
         }
@@ -632,9 +735,13 @@ private final class VADController: @unchecked Sendable {
             }
         case .stop(let reason):
             print("[VAD] Stopping Doubao voice input: \(reason).")
-            if !tapper.tap(context: "stop") {
+            lastStopAttemptAt = now
+            if tapper.tap(context: "stop") {
+                detector.confirmStop(now: now)
+                print("[VAD] Stop confirmed; returned to waiting state.")
+            } else {
                 fputs(
-                    "WARNING: stop click could not be created; Doubao may still be recording.\n",
+                    "WARNING: stop click failed; recording state is retained and retry is scheduled.\n",
                     stderr
                 )
             }
@@ -645,61 +752,73 @@ private final class VADController: @unchecked Sendable {
 
 private final class AudioMonitor: @unchecked Sendable {
     private let engine = AVAudioEngine()
+    private let controlQueue = DispatchQueue(label: "dji-mic-voice.audio-control")
     private var tapInstalled = false
 
     func start(device: AudioInputDevice, controller: VADController) throws -> AVAudioFormat {
-        let inputNode = engine.inputNode
-        guard let audioUnit = inputNode.audioUnit else {
-            throw UserError("AVAudioEngine did not provide an input AudioUnit.")
-        }
+        try controlQueue.sync {
+            let inputNode = engine.inputNode
+            guard let audioUnit = inputNode.audioUnit else {
+                throw UserError("AVAudioEngine did not provide an input AudioUnit.")
+            }
 
-        var deviceID = device.id
-        let status = AudioUnitSetProperty(
-            audioUnit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            0,
-            &deviceID,
-            UInt32(MemoryLayout<AudioDeviceID>.size)
-        )
-        guard status == noErr else {
-            throw UserError(
-                "Unable to select \"\(device.name)\" in AVAudioEngine "
-                    + "(AudioUnit \(coreAudioStatus(status)))."
+            var deviceID = device.id
+            let status = AudioUnitSetProperty(
+                audioUnit,
+                kAudioOutputUnitProperty_CurrentDevice,
+                kAudioUnitScope_Global,
+                0,
+                &deviceID,
+                UInt32(MemoryLayout<AudioDeviceID>.size)
             )
-        }
+            guard status == noErr else {
+                throw UserError(
+                    "Unable to select \"\(device.name)\" in AVAudioEngine "
+                        + "(AudioUnit \(coreAudioStatus(status)))."
+                )
+            }
 
-        let format = inputNode.outputFormat(forBus: 0)
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            throw UserError("Selected input has an invalid audio format: \(format).")
-        }
+            let format = inputNode.outputFormat(forBus: 0)
+            guard format.sampleRate > 0, format.channelCount > 0 else {
+                throw UserError("Selected input has an invalid audio format: \(format).")
+            }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1_024, format: format) {
-            buffer,
-            _ in
-            let level = Self.levelDBFS(buffer)
-            let duration = Double(buffer.frameLength) / format.sampleRate
-            controller.accept(levelDB: level, duration: duration)
-        }
-        tapInstalled = true
+            inputNode.installTap(onBus: 0, bufferSize: 1_024, format: format) {
+                buffer,
+                _ in
+                let level = Self.levelDBFS(buffer)
+                let duration = Double(buffer.frameLength) / format.sampleRate
+                controller.accept(levelDB: level, duration: duration)
+            }
+            tapInstalled = true
 
-        engine.prepare()
-        do {
-            try engine.start()
-        } catch {
-            inputNode.removeTap(onBus: 0)
-            tapInstalled = false
-            throw UserError("AVAudioEngine failed to start: \(error.localizedDescription)")
+            engine.prepare()
+            do {
+                try engine.start()
+            } catch {
+                // The tap was installed before engine.start(), so unwind it
+                // before surfacing the startup error.
+                inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+                throw UserError("AVAudioEngine failed to start: \(error.localizedDescription)")
+            }
+            return format
         }
-        return format
     }
 
     func stop() {
-        if tapInstalled {
-            engine.inputNode.removeTap(onBus: 0)
-            tapInstalled = false
+        controlQueue.sync {
+            // AVAudioEngine graph changes are serialized here. Remove the tap
+            // exactly once before stopping the engine so no callback can race
+            // a second removeTap/stop sequence.
+            if tapInstalled {
+                engine.inputNode.removeTap(onBus: 0)
+                tapInstalled = false
+            }
+            if engine.isRunning {
+                engine.stop()
+            }
         }
-        engine.stop()
     }
 
     private static func levelDBFS(_ buffer: AVAudioPCMBuffer) -> Double {
@@ -736,6 +855,25 @@ private final class ShutdownGate: @unchecked Sendable {
         guard !started else { return false }
         started = true
         return true
+    }
+}
+
+private final class RuntimeExitState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var code: Int32 = EXIT_SUCCESS
+    private var reason: String?
+
+    func fail(_ reason: String) {
+        lock.lock()
+        code = EXIT_FAILURE
+        self.reason = reason
+        lock.unlock()
+    }
+
+    func snapshot() -> (code: Int32, reason: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (code, reason)
     }
 }
 
@@ -792,8 +930,18 @@ private func runSelfTest() throws {
         now += 0.05
     }
     guard detector.process(levelDB: -80, duration: 0.05, now: now)
-        == .stop(reason: "sustained silence") else {
+        == .stop(reason: "sustained silence"),
+          detector.isActive,
+          detector.pendingStopReason == "sustained silence" else {
         throw UserError("SELF-TEST FAIL: sustained silence did not stop.")
+    }
+    guard detector.retryPendingStop() == .stop(reason: "sustained silence"),
+          detector.isActive else {
+        throw UserError("SELF-TEST FAIL: failed stop did not retain active state for retry.")
+    }
+    detector.confirmStop(now: now)
+    guard !detector.isActive, detector.pendingStopReason == nil else {
+        throw UserError("SELF-TEST FAIL: successful stop was not confirmed.")
     }
 
     for _ in 0..<5 {
@@ -815,8 +963,39 @@ private func runSelfTest() throws {
         throw UserError("SELF-TEST FAIL: timeout scenario did not start.")
     }
     guard timeoutDetector.checkTimeout(now: 20.21)
-        == .stop(reason: "maximum session timeout") else {
+        == .stop(reason: "maximum session timeout"),
+          timeoutDetector.isActive else {
         throw UserError("SELF-TEST FAIL: maximum session timeout did not stop.")
+    }
+    timeoutDetector.confirmStop(now: 20.21)
+
+    var failedStartDetector = VADDetector(
+        startThresholdDB: -40,
+        stopThresholdDB: -46,
+        requiredSpeechSeconds: 0.1,
+        requiredSilenceSeconds: 1.0,
+        cooldownSeconds: 0.7,
+        maxSessionSeconds: 2.0
+    )
+    guard failedStartDetector.process(levelDB: -20, duration: 0.1, now: 25) == .start else {
+        throw UserError("SELF-TEST FAIL: failed-start scenario did not start.")
+    }
+    failedStartDetector.cancelFailedStart(now: 25)
+    guard !failedStartDetector.isActive,
+          failedStartDetector.pendingStopReason == nil else {
+        throw UserError("SELF-TEST FAIL: failed start was not cleaned up.")
+    }
+
+    var watchdog = AudioCallbackWatchdog(timeoutSeconds: 1.5)
+    watchdog.begin(now: 30)
+    guard !watchdog.detectStall(now: 31.49) else {
+        throw UserError("SELF-TEST FAIL: audio watchdog fired too early.")
+    }
+    watchdog.heartbeat(now: 31.0)
+    guard !watchdog.detectStall(now: 32.49),
+          watchdog.detectStall(now: 32.5),
+          !watchdog.detectStall(now: 34) else {
+        throw UserError("SELF-TEST FAIL: audio watchdog timing is incorrect.")
     }
 
     let fakeDevices = [
@@ -835,9 +1014,67 @@ private func runSelfTest() throws {
     }
 
     print(
-        "SELF-TEST PASS: device selection, speech start, silence stop, "
-            + "debounce, timeout, and key code 61."
+        "SELF-TEST PASS: device selection, start cleanup, retained/retried stop, "
+            + "silence stop, debounce, 1.5 s audio watchdog, session timeout, and key code 61."
     )
+}
+
+private func runDryRunSimulation(configuration: Configuration) throws {
+    var detector = VADDetector(
+        startThresholdDB: configuration.startThresholdDB,
+        stopThresholdDB: configuration.stopThresholdDB,
+        requiredSpeechSeconds: configuration.startMilliseconds / 1_000,
+        requiredSilenceSeconds: configuration.silenceMilliseconds / 1_000,
+        cooldownSeconds: configuration.cooldownMilliseconds / 1_000,
+        maxSessionSeconds: configuration.maxSessionSeconds
+    )
+    let tapper = RightOptionTapper(dryRun: true)
+    let frameSeconds = 0.05
+    var now = 100.0
+    var startCount = 0
+    var stopCount = 0
+
+    let speechFrames = Int(ceil(configuration.startMilliseconds / 50.0)) + 1
+    for _ in 0..<speechFrames {
+        if detector.process(
+            levelDB: configuration.startThresholdDB + 10,
+            duration: frameSeconds,
+            now: now
+        ) == .start {
+            guard tapper.tap(context: "start") else {
+                detector.cancelFailedStart(now: now)
+                throw UserError("DRY-RUN FAIL: simulated start click failed.")
+            }
+            startCount += 1
+        }
+        now += frameSeconds
+    }
+
+    let silenceFrames = Int(ceil(configuration.silenceMilliseconds / 50.0)) + 1
+    for _ in 0..<silenceFrames {
+        if case .stop = detector.process(
+            levelDB: configuration.stopThresholdDB - 10,
+            duration: frameSeconds,
+            now: now
+        ) {
+            guard tapper.tap(context: "stop") else {
+                throw UserError("DRY-RUN FAIL: simulated stop click failed.")
+            }
+            detector.confirmStop(now: now)
+            stopCount += 1
+        }
+        now += frameSeconds
+    }
+
+    guard startCount == 1,
+          stopCount == 1,
+          !detector.isActive,
+          detector.pendingStopReason == nil else {
+        throw UserError(
+            "DRY-RUN FAIL: expected one complete start-to-silence-stop transition."
+        )
+    }
+    print("DRY-RUN PASS: one speech start and one sustained-silence stop were confirmed.")
 }
 
 do {
@@ -848,6 +1085,10 @@ do {
     }
     if configuration.selfTest {
         try runSelfTest()
+        exit(EXIT_SUCCESS)
+    }
+    if configuration.simulateVAD {
+        try runDryRunSimulation(configuration: configuration)
         exit(EXIT_SUCCESS)
     }
 
@@ -875,10 +1116,20 @@ do {
         )
     }
 
+    let runtimeExitState = RuntimeExitState()
     let tapper = RightOptionTapper(dryRun: configuration.dryRun)
-    let controller = VADController(configuration: configuration, tapper: tapper)
+    let controller = VADController(
+        configuration: configuration,
+        tapper: tapper,
+        onAudioStall: { message in
+            runtimeExitState.fail(message)
+            // Route watchdog failure through the normal serialized teardown.
+            _ = kill(getpid(), SIGTERM)
+        }
+    )
     let monitor = AudioMonitor()
     let format = try monitor.start(device: selectedDevice, controller: controller)
+    controller.beginAudioWatchdog()
 
     print(
         "Listening to \"\(selectedDevice.name)\" "
@@ -909,9 +1160,13 @@ do {
         guard shutdownGate.begin() else { return }
 
         print("\nStopping safely...")
-        monitor.stop()
         controller.shutdown()
-        exit(EXIT_SUCCESS)
+        monitor.stop()
+        let result = runtimeExitState.snapshot()
+        if let reason = result.reason {
+            fputs("EXITING WITH ERROR: \(reason)\n", stderr)
+        }
+        exit(result.code)
     }
     interruptSource.setEventHandler(handler: shutdown)
     terminateSource.setEventHandler(handler: shutdown)
