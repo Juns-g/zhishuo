@@ -9,6 +9,8 @@
  - Starts after sustained speech, then clicks Right Option once.
  - Clicks Right Option again after 0.8-1.2 seconds of silence or at the
    configured maximum recording time.
+ - With --auto-enter, presses Return after a successful stop so the focused
+   composer can send the completed transcription.
  - Uses an energy-based VAD with separate start/stop thresholds, hysteresis,
    sustained-speech confirmation, cooldown debounce, and a timeout failsafe.
  - Retains the recording state and retries if a stop event cannot be created.
@@ -34,6 +36,7 @@
 
    ./task/vad-voice-trigger --list-devices
    ./task/vad-voice-trigger --device "Wireless Mic Rx"
+   ./task/vad-voice-trigger --device "Wireless Mic Rx" --auto-enter
 
  The default device is already "Wireless Mic Rx", so the final command may
  also be written as:
@@ -66,8 +69,9 @@
  ----------------------------
  Swift imports CGEventCreateKeyboardEvent as
  CGEvent(keyboardEventSource:virtualKey:keyDown:). The key code below is 61,
- the macOS virtual key code for Right Option. Both key-down and key-up carry
- the Option modifier flag and are posted to the HID event tap.
+ the macOS virtual key code for Right Option; Return uses key code 36. Right
+ Option carries the Option modifier flag, while Return is posted without
+ modifiers. Both use paired key-down/key-up events on the HID event tap.
  */
 
 import ApplicationServices
@@ -81,6 +85,8 @@ import Foundation
 
 private let defaultDJIDeviceName = "Wireless Mic Rx"
 private let rightOptionKeyCode: CGKeyCode = 61
+private let returnKeyCode: CGKeyCode = 36
+private let autoEnterDelayMicroseconds: useconds_t = 250_000
 private let minimumSilenceMilliseconds = 800.0
 private let maximumSilenceMilliseconds = 1_200.0
 private let audioWatchdogSeconds = 1.5
@@ -108,6 +114,7 @@ private struct Configuration {
     var cooldownMilliseconds = 700.0
     var maxSessionSeconds = 120.0
     var dryRun = false
+    var autoEnter = false
     var listDevices = false
     var selfTest = false
     var simulateVAD = false
@@ -129,7 +136,8 @@ private func printUsage() {
           --silence-ms MS       Silence before stopping, 800-1200 (default: 1000 ms).
           --cooldown-ms MS      Post-stop debounce window (default: 700 ms).
           --max-seconds SEC     Failsafe recording timeout (default: 120 s).
-          --dry-run             Print VAD actions without sending Right Option.
+          --dry-run             Print VAD actions without sending keyboard events.
+          --auto-enter          Press Return after a successful stop (default: off).
           --simulate-vad        With --dry-run, simulate speech then silence and exit.
           --self-test           Test VAD transitions without audio or permissions.
           --help                Show this help.
@@ -210,6 +218,9 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
             index += 2
         case "--dry-run":
             configuration.dryRun = true
+            index += 1
+        case "--auto-enter":
+            configuration.autoEnter = true
             index += 1
         case "--self-test":
             configuration.selfTest = true
@@ -600,14 +611,14 @@ private struct AudioCallbackWatchdog {
     }
 }
 
-private final class RightOptionTapper: @unchecked Sendable {
+private final class KeyboardTapper: @unchecked Sendable {
     private let dryRun: Bool
 
     init(dryRun: Bool) {
         self.dryRun = dryRun
     }
 
-    func tap(context: String) -> Bool {
+    func tapRightOption(context: String) -> Bool {
         if dryRun {
             print("[DRY RUN] Right Option click: \(context)")
             fflush(stdout)
@@ -640,11 +651,46 @@ private final class RightOptionTapper: @unchecked Sendable {
         fflush(stdout)
         return true
     }
+
+    func tapReturn(context: String) -> Bool {
+        if dryRun {
+            print("[DRY RUN] Return click: \(context)")
+            fflush(stdout)
+            return true
+        }
+
+        // Give Doubao's stop shortcut a small head start before submitting the
+        // focused composer. This delay is intentionally outside the VAD state
+        // machine, so a failed Return never reopens or retries the voice stop.
+        usleep(autoEnterDelayMicroseconds)
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let keyDown = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: returnKeyCode,
+                  keyDown: true
+              ),
+              let keyUp = CGEvent(
+                  keyboardEventSource: source,
+                  virtualKey: returnKeyCode,
+                  keyDown: false
+              ) else {
+            fputs("Unable to create Return CGEvents.\n", stderr)
+            return false
+        }
+
+        keyDown.post(tap: .cghidEventTap)
+        usleep(30_000)
+        keyUp.post(tap: .cghidEventTap)
+        print("[KEY] Return click: \(context)")
+        fflush(stdout)
+        return true
+    }
 }
 
 private final class VADController: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dji-mic-voice.vad")
-    private let tapper: RightOptionTapper
+    private let tapper: KeyboardTapper
+    private let autoEnter: Bool
     private let onAudioStall: @Sendable (String) -> Void
     private var detector: VADDetector
     private var audioWatchdog = AudioCallbackWatchdog(timeoutSeconds: audioWatchdogSeconds)
@@ -655,7 +701,7 @@ private final class VADController: @unchecked Sendable {
 
     init(
         configuration: Configuration,
-        tapper: RightOptionTapper,
+        tapper: KeyboardTapper,
         onAudioStall: @escaping @Sendable (String) -> Void
     ) {
         detector = VADDetector(
@@ -667,6 +713,7 @@ private final class VADController: @unchecked Sendable {
             maxSessionSeconds: configuration.maxSessionSeconds
         )
         self.tapper = tapper
+        autoEnter = configuration.autoEnter
         self.onAudioStall = onAudioStall
 
         // One timer owns stop retries, maximum-session checks, and the audio
@@ -750,16 +797,23 @@ private final class VADController: @unchecked Sendable {
         switch action {
         case .start:
             print("[VAD] Sustained speech detected; starting Doubao voice input.")
-            if !tapper.tap(context: "start") {
+            if !tapper.tapRightOption(context: "start") {
                 detector.cancelFailedStart(now: now)
                 fputs("Start click failed; VAD returned to waiting state.\n", stderr)
             }
         case .stop(let reason):
             print("[VAD] Stopping Doubao voice input: \(reason).")
             lastStopAttemptAt = now
-            if tapper.tap(context: "stop") {
+            if tapper.tapRightOption(context: "stop") {
                 detector.confirmStop(now: now)
                 print("[VAD] Stop confirmed; returned to waiting state.")
+                if autoEnter,
+                   !tapper.tapReturn(context: "auto-enter after stop") {
+                    fputs(
+                        "WARNING: stop succeeded, but the automatic Return click failed.\n",
+                        stderr
+                    )
+                }
             } else {
                 fputs(
                     "WARNING: stop click failed; recording state is retained and retry is scheduled.\n",
@@ -925,6 +979,12 @@ private func hasAccessibilityPermission(prompt: Bool) -> Bool {
 }
 
 private func runSelfTest() throws {
+    let defaultConfiguration = try parseArguments([])
+    let autoEnterConfiguration = try parseArguments(["--auto-enter"])
+    guard !defaultConfiguration.autoEnter, autoEnterConfiguration.autoEnter else {
+        throw UserError("SELF-TEST FAIL: --auto-enter parsing/default is incorrect.")
+    }
+
     var detector = VADDetector(
         startThresholdDB: -40,
         stopThresholdDB: -46,
@@ -1029,6 +1089,8 @@ private func runSelfTest() throws {
     }
 
     guard rightOptionKeyCode == 61,
+          returnKeyCode == 36,
+          autoEnterDelayMicroseconds == 250_000,
           minimumSilenceMilliseconds == 800,
           maximumSilenceMilliseconds == 1_200 else {
         throw UserError("SELF-TEST FAIL: required constants changed.")
@@ -1036,7 +1098,8 @@ private func runSelfTest() throws {
 
     print(
         "SELF-TEST PASS: device selection, start cleanup, retained/retried stop, "
-            + "silence stop, debounce, 1.5 s audio watchdog, session timeout, and key code 61."
+            + "silence stop, debounce, 1.5 s audio watchdog, session timeout, "
+            + "--auto-enter parsing, and key codes 61/36."
     )
 }
 
@@ -1049,7 +1112,7 @@ private func runDryRunSimulation(configuration: Configuration) throws {
         cooldownSeconds: configuration.cooldownMilliseconds / 1_000,
         maxSessionSeconds: configuration.maxSessionSeconds
     )
-    let tapper = RightOptionTapper(dryRun: true)
+    let tapper = KeyboardTapper(dryRun: true)
     let frameSeconds = 0.05
     var now = 100.0
     var startCount = 0
@@ -1062,7 +1125,7 @@ private func runDryRunSimulation(configuration: Configuration) throws {
             duration: frameSeconds,
             now: now
         ) == .start {
-            guard tapper.tap(context: "start") else {
+            guard tapper.tapRightOption(context: "start") else {
                 detector.cancelFailedStart(now: now)
                 throw UserError("DRY-RUN FAIL: simulated start click failed.")
             }
@@ -1078,10 +1141,14 @@ private func runDryRunSimulation(configuration: Configuration) throws {
             duration: frameSeconds,
             now: now
         ) {
-            guard tapper.tap(context: "stop") else {
+            guard tapper.tapRightOption(context: "stop") else {
                 throw UserError("DRY-RUN FAIL: simulated stop click failed.")
             }
             detector.confirmStop(now: now)
+            if configuration.autoEnter,
+               !tapper.tapReturn(context: "auto-enter after stop") {
+                throw UserError("DRY-RUN FAIL: simulated Return click failed.")
+            }
             stopCount += 1
         }
         now += frameSeconds
@@ -1138,7 +1205,7 @@ do {
     }
 
     let runtimeExitState = RuntimeExitState()
-    let tapper = RightOptionTapper(dryRun: configuration.dryRun)
+    let tapper = KeyboardTapper(dryRun: configuration.dryRun)
     let controller = VADController(
         configuration: configuration,
         tapper: tapper,
@@ -1168,6 +1235,9 @@ do {
             configuration.dryRun ? " DRY RUN." : ""
         )
     )
+    if configuration.autoEnter {
+        print("Auto-enter is ON: Return will be pressed after each successful stop.")
+    }
     print("Press Control-C to stop safely.")
     fflush(stdout)
 
