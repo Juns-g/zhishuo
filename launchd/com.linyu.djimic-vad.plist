@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.linyu.djimic-vad</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>~/projects/dji-mic-voice/task/vad-voice-trigger</string>
+        <string>--device</string>
+        <string>Wireless Mic Rx</string>
+        <string>--auto-enter</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>~/projects/dji-mic-voice</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>StandardOutPath</key>
+    <string>~/Library/Logs/djimic-vad.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>~/Library/Logs/djimic-vad.log</string>
+</dict>
+</plist>
