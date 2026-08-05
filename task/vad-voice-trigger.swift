@@ -86,7 +86,7 @@ import Foundation
 private let defaultDJIDeviceName = "Wireless Mic Rx"
 private let rightOptionKeyCode: CGKeyCode = 61
 private let returnKeyCode: CGKeyCode = 36
-private let autoEnterDelayMicroseconds: useconds_t = 250_000
+private let defaultAutoEnterDelayMilliseconds = 1_200.0
 private let minimumSilenceMilliseconds = 800.0
 private let maximumSilenceMilliseconds = 1_200.0
 private let audioWatchdogSeconds = 1.5
@@ -115,6 +115,7 @@ private struct Configuration {
     var maxSessionSeconds = 120.0
     var dryRun = false
     var autoEnter = false
+    var autoEnterDelayMilliseconds = defaultAutoEnterDelayMilliseconds
     var listDevices = false
     var selfTest = false
     var simulateVAD = false
@@ -138,6 +139,8 @@ private func printUsage() {
           --max-seconds SEC     Failsafe recording timeout (default: 120 s).
           --dry-run             Print VAD actions without sending keyboard events.
           --auto-enter          Press Return after a successful stop (default: off).
+          --auto-enter-delay-ms MS
+                                Wait before Return (default: 1200 ms).
           --simulate-vad        With --dry-run, simulate speech then silence and exit.
           --self-test           Test VAD transitions without audio or permissions.
           --help                Show this help.
@@ -222,6 +225,12 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
         case "--auto-enter":
             configuration.autoEnter = true
             index += 1
+        case "--auto-enter-delay-ms":
+            configuration.autoEnterDelayMilliseconds = try parseDouble(
+                requiredValue(after: argument),
+                option: argument
+            )
+            index += 2
         case "--self-test":
             configuration.selfTest = true
             index += 1
@@ -254,6 +263,9 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
     }
     guard configuration.maxSessionSeconds > 0 else {
         throw UserError("--max-seconds must be greater than 0.")
+    }
+    guard configuration.autoEnterDelayMilliseconds >= 0 else {
+        throw UserError("--auto-enter-delay-ms must be at least 0.")
     }
     guard !configuration.simulateVAD || configuration.dryRun else {
         throw UserError("--simulate-vad must be used with --dry-run.")
@@ -613,9 +625,11 @@ private struct AudioCallbackWatchdog {
 
 private final class KeyboardTapper: @unchecked Sendable {
     private let dryRun: Bool
+    private let autoEnterDelayMilliseconds: Double
 
-    init(dryRun: Bool) {
+    init(dryRun: Bool, autoEnterDelayMilliseconds: Double) {
         self.dryRun = dryRun
+        self.autoEnterDelayMilliseconds = autoEnterDelayMilliseconds
     }
 
     func tapRightOption(context: String) -> Bool {
@@ -659,10 +673,12 @@ private final class KeyboardTapper: @unchecked Sendable {
             return true
         }
 
-        // Give Doubao's stop shortcut a small head start before submitting the
-        // focused composer. This delay is intentionally outside the VAD state
-        // machine, so a failed Return never reopens or retries the voice stop.
-        usleep(autoEnterDelayMicroseconds)
+        // Doubao finalizes and streams the last transcription asynchronously
+        // after its stop shortcut. Return sent too early can hit an empty or
+        // unfinished composer, so the configurable delay defaults to 1200 ms.
+        // It stays outside the VAD state machine: a failed Return must never
+        // reopen or retry the already-completed voice stop.
+        Thread.sleep(forTimeInterval: autoEnterDelayMilliseconds / 1_000)
         guard let source = CGEventSource(stateID: .hidSystemState),
               let keyDown = CGEvent(
                   keyboardEventSource: source,
@@ -980,9 +996,23 @@ private func hasAccessibilityPermission(prompt: Bool) -> Bool {
 
 private func runSelfTest() throws {
     let defaultConfiguration = try parseArguments([])
-    let autoEnterConfiguration = try parseArguments(["--auto-enter"])
-    guard !defaultConfiguration.autoEnter, autoEnterConfiguration.autoEnter else {
-        throw UserError("SELF-TEST FAIL: --auto-enter parsing/default is incorrect.")
+    let autoEnterConfiguration = try parseArguments([
+        "--auto-enter", "--auto-enter-delay-ms", "1750",
+    ])
+    guard !defaultConfiguration.autoEnter,
+          defaultConfiguration.autoEnterDelayMilliseconds == 1_200,
+          autoEnterConfiguration.autoEnter,
+          autoEnterConfiguration.autoEnterDelayMilliseconds == 1_750 else {
+        throw UserError("SELF-TEST FAIL: auto-enter parsing/default is incorrect.")
+    }
+    var rejectedNegativeAutoEnterDelay = false
+    do {
+        _ = try parseArguments(["--auto-enter-delay-ms", "-1"])
+    } catch {
+        rejectedNegativeAutoEnterDelay = true
+    }
+    guard rejectedNegativeAutoEnterDelay else {
+        throw UserError("SELF-TEST FAIL: negative auto-enter delay was accepted.")
     }
 
     var detector = VADDetector(
@@ -1090,7 +1120,7 @@ private func runSelfTest() throws {
 
     guard rightOptionKeyCode == 61,
           returnKeyCode == 36,
-          autoEnterDelayMicroseconds == 250_000,
+          defaultAutoEnterDelayMilliseconds == 1_200,
           minimumSilenceMilliseconds == 800,
           maximumSilenceMilliseconds == 1_200 else {
         throw UserError("SELF-TEST FAIL: required constants changed.")
@@ -1099,7 +1129,7 @@ private func runSelfTest() throws {
     print(
         "SELF-TEST PASS: device selection, start cleanup, retained/retried stop, "
             + "silence stop, debounce, 1.5 s audio watchdog, session timeout, "
-            + "--auto-enter parsing, and key codes 61/36."
+            + "auto-enter delay parsing/default/rejection, and key codes 61/36."
     )
 }
 
@@ -1112,7 +1142,10 @@ private func runDryRunSimulation(configuration: Configuration) throws {
         cooldownSeconds: configuration.cooldownMilliseconds / 1_000,
         maxSessionSeconds: configuration.maxSessionSeconds
     )
-    let tapper = KeyboardTapper(dryRun: true)
+    let tapper = KeyboardTapper(
+        dryRun: true,
+        autoEnterDelayMilliseconds: configuration.autoEnterDelayMilliseconds
+    )
     let frameSeconds = 0.05
     var now = 100.0
     var startCount = 0
@@ -1205,7 +1238,10 @@ do {
     }
 
     let runtimeExitState = RuntimeExitState()
-    let tapper = KeyboardTapper(dryRun: configuration.dryRun)
+    let tapper = KeyboardTapper(
+        dryRun: configuration.dryRun,
+        autoEnterDelayMilliseconds: configuration.autoEnterDelayMilliseconds
+    )
     let controller = VADController(
         configuration: configuration,
         tapper: tapper,
@@ -1236,7 +1272,12 @@ do {
         )
     )
     if configuration.autoEnter {
-        print("Auto-enter is ON: Return will be pressed after each successful stop.")
+        print(
+            String(
+                format: "Auto-enter is ON: Return will be pressed %.0f ms after each successful stop.",
+                configuration.autoEnterDelayMilliseconds
+            )
+        )
     }
     print("Press Control-C to stop safely.")
     fflush(stdout)

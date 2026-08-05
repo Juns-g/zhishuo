@@ -11,6 +11,8 @@
         <string>--device</string>
         <string>Wireless Mic Rx</string>
         <string>--auto-enter</string>
+        <string>--auto-enter-delay-ms</string>
+        <string>1200</string>
     </array>
 
     <key>WorkingDirectory</key>
