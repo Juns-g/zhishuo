@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.linyu.djimic-vad</string>
+    <string>com.zhishuo.vad</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -37,4 +37,3 @@
     <string>__LOG_PATH__</string>
 </dict>
 </plist>
-

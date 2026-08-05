@@ -5,29 +5,36 @@ set -euo pipefail
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 REPO_ROOT="$(dirname -- "$SCRIPT_DIR")"
 SOURCE_PATH="$REPO_ROOT/task/vad-voice-trigger.swift"
-PLIST_TEMPLATE="$SCRIPT_DIR/com.linyu.djimic-vad.plist"
+PLIST_TEMPLATE="$SCRIPT_DIR/com.zhishuo.vad.plist"
 
-LABEL="com.linyu.djimic-vad"
-INSTALL_DIR="${DJIMIC_INSTALL_DIR:-$HOME/Library/Application Support/djimic-vad}"
+LABEL="com.zhishuo.vad"
+# Prefer ZHISHUO_* env; fall back to legacy DJIMIC_* for existing installs.
+INSTALL_DIR="${ZHISHUO_INSTALL_DIR:-${DJIMIC_INSTALL_DIR:-$HOME/Library/Application Support/zhishuo}}"
 LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
 LOG_DIR="$HOME/Library/Logs"
 PLIST_PATH="$LAUNCH_AGENTS_DIR/$LABEL.plist"
-LOG_PATH="$LOG_DIR/djimic-vad.log"
-DEVICE_NAME="${DJIMIC_DEVICE_NAME:-Wireless Mic Rx}"
-AUTO_ENTER_DELAY_MS="${DJIMIC_AUTO_ENTER_DELAY_MS:-1200}"
-CODESIGN_IDENTITY="${DJIMIC_CODESIGN_IDENTITY:-}"
+LOG_PATH="${ZHISHUO_LOG_PATH:-${DJIMIC_LOG_PATH:-$LOG_DIR/zhishuo.log}}"
+DEVICE_NAME="${ZHISHUO_DEVICE_NAME:-${DJIMIC_DEVICE_NAME:-Wireless Mic Rx}}"
+AUTO_ENTER_DELAY_MS="${ZHISHUO_AUTO_ENTER_DELAY_MS:-${DJIMIC_AUTO_ENTER_DELAY_MS:-1200}}"
+CODESIGN_IDENTITY="${ZHISHUO_CODESIGN_IDENTITY:-${DJIMIC_CODESIGN_IDENTITY:-}}"
 SHOW_PERMISSION_GUIDE=1
 START_SERVICE=1
+
+# Old personal label (migrated away in this release).
+LEGACY_LABEL="com.linyu.djimic-vad"
+LEGACY_PLIST_PATH="$LAUNCH_AGENTS_DIR/$LEGACY_LABEL.plist"
 
 usage() {
     print -r -- "Usage: ./install/install.sh [options]"
     print -r -- ""
-    print -r -- "  --device NAME              Input device (default: Wireless Mic Rx)"
-    print -r -- "  --auto-enter-delay-ms MS   Delay before Return (default: 1200)"
-    print -r -- "  --sign IDENTITY            Sign with a Keychain code-signing identity"
-    print -r -- "  --no-permission-guide      Do not open the macOS permission guide"
-    print -r -- "  --no-start                 Install files without loading launchd"
-    print -r -- "  --help                     Show this help"
+    print -r -- "  直说 (ZhiShuo) — 安装本机 VAD 声控服务"
+    print -r -- ""
+    print -r -- "  --device NAME              输入设备名（默认: Wireless Mic Rx）"
+    print -r -- "  --auto-enter-delay-ms MS   停说后发送 Return 的延迟（默认: 1200）"
+    print -r -- "  --sign IDENTITY            使用钥匙串中的代码签名身份签名"
+    print -r -- "  --no-permission-guide      不打开 macOS 权限引导"
+    print -r -- "  --no-start                 只安装文件，不加载 launchd"
+    print -r -- "  --help                     显示帮助"
 }
 
 fail() {
@@ -82,20 +89,20 @@ command -v codesign >/dev/null || fail "codesign is required."
 
 BUILD_PARENT="${TMPDIR:-/tmp}"
 BUILD_PARENT="${BUILD_PARENT%/}"
-BUILD_DIR="$(mktemp -d "$BUILD_PARENT/djimic-vad-install.XXXXXX")"
+BUILD_DIR="$(mktemp -d "$BUILD_PARENT/zhishuo-install.XXXXXX")"
 STAGED_BINARY="$BUILD_DIR/vad-voice-trigger"
 STAGED_PLIST="$BUILD_DIR/$LABEL.plist"
 
 cleanup() {
     case "${BUILD_DIR:-}" in
-        "$BUILD_PARENT"/djimic-vad-install.*)
+        "$BUILD_PARENT"/zhishuo-install.*)
             [[ -d "$BUILD_DIR" ]] && rm -rf -- "$BUILD_DIR"
             ;;
     esac
 }
 trap cleanup EXIT INT TERM
 
-print -r -- "Building vad-voice-trigger..."
+print -r -- "Building 直说 (vad-voice-trigger)..."
 swiftc \
     -framework AVFoundation \
     -framework AVFAudio \
@@ -124,7 +131,15 @@ PREVIOUS_PLIST="$INSTALL_DIR/$LABEL.plist.previous"
 codesign --verify --strict --verbose=2 "$STAGED_BINARY"
 "$STAGED_BINARY" --self-test
 
+# ProgramArguments layout (must stay 6 entries, matching the template):
+#   0: binary path
+#   1: --device
+#   2: device name
+#   3: --auto-enter
+#   4: --auto-enter-delay-ms
+#   5: delay ms
 cp -- "$PLIST_TEMPLATE" "$STAGED_PLIST"
+/usr/libexec/PlistBuddy -c "Set :Label $LABEL" "$STAGED_PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 \"$BIN_PATH\"" "$STAGED_PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 \"$DEVICE_NAME\"" "$STAGED_PLIST"
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:5 \"$AUTO_ENTER_DELAY_MS\"" "$STAGED_PLIST"
@@ -143,6 +158,17 @@ mkdir -p -- "$INSTALL_DIR" "$LAUNCH_AGENTS_DIR" "$LOG_DIR"
 
 USER_ID="$(id -u)"
 LAUNCH_DOMAIN="gui/$USER_ID"
+
+# Unload legacy personal label if present.
+if launchctl print "$LAUNCH_DOMAIN/$LEGACY_LABEL" >/dev/null 2>&1; then
+    print -r -- "Stopping legacy LaunchAgent: $LEGACY_LABEL ..."
+    launchctl bootout "$LAUNCH_DOMAIN/$LEGACY_LABEL" || true
+fi
+if [[ -f "$LEGACY_PLIST_PATH" ]]; then
+    print -r -- "Removing legacy plist: $LEGACY_PLIST_PATH"
+    rm -f -- "$LEGACY_PLIST_PATH"
+fi
+
 if launchctl print "$LAUNCH_DOMAIN/$LABEL" >/dev/null 2>&1; then
     print -r -- "Stopping the existing LaunchAgent..."
     launchctl bootout "$LAUNCH_DOMAIN/$LABEL"
@@ -159,16 +185,16 @@ install -m 644 "$STAGED_PLIST" "$PLIST_PATH"
 plutil -lint "$PLIST_PATH"
 
 if (( SHOW_PERMISSION_GUIDE )); then
-    export DJIMIC_GUIDE_BINARY="$BIN_PATH"
+    export ZHISHUO_GUIDE_BINARY="$BIN_PATH"
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
     osascript <<'APPLESCRIPT'
-set binaryPath to system attribute "DJIMIC_GUIDE_BINARY"
-display dialog "请在“辅助功能”页面点击 +，添加下面的程序并开启：" & return & return & binaryPath & return & return & "完成后点击“下一步”。" buttons {"下一步"} default button "下一步" with title "DJI Mic VAD 安装"
+set binaryPath to system attribute "ZHISHUO_GUIDE_BINARY"
+display dialog "【直说 ZhiShuo】请在「辅助功能」中点击 +，添加下面的程序并打开开关：" & return & return & binaryPath & return & return & "说明：macOS 按「可执行文件身份」授权。请添加安装后的固定路径（不要只勾 Terminal）。" & return & return & "完成后点「下一步」。" buttons {"下一步"} default button "下一步" with title "直说 ZhiShuo 安装"
 APPLESCRIPT
     open "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
     osascript <<'APPLESCRIPT'
-set binaryPath to system attribute "DJIMIC_GUIDE_BINARY"
-display dialog "请在“麦克风”页面点击 +，添加下面的程序并开启：" & return & return & binaryPath & return & return & "完成后点击“继续安装”。" buttons {"继续安装"} default button "继续安装" with title "DJI Mic VAD 安装"
+set binaryPath to system attribute "ZHISHUO_GUIDE_BINARY"
+display dialog "【直说 ZhiShuo】请在「麦克风」中点击 +，添加同一程序并打开开关：" & return & return & binaryPath & return & return & "完成后点「继续安装」。" buttons {"继续安装"} default button "继续安装" with title "直说 ZhiShuo 安装"
 APPLESCRIPT
 fi
 
@@ -181,7 +207,10 @@ else
 fi
 
 print -r -- ""
-print -r -- "Installed binary: $BIN_PATH"
-print -r -- "Installed plist:  $PLIST_PATH"
-print -r -- "Log:              $LOG_PATH"
-print -r -- "Signing:          $SIGNING_MODE"
+print -r -- "直说 (ZhiShuo) installed."
+print -r -- "Binary:  $BIN_PATH"
+print -r -- "plist:   $PLIST_PATH"
+print -r -- "Log:     $LOG_PATH"
+print -r -- "Signing: $SIGNING_MODE"
+print -r -- "Device:  $DEVICE_NAME"
+print -r -- "Auto-enter delay: ${AUTO_ENTER_DELAY_MS} ms"
