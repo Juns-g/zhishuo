@@ -236,7 +236,7 @@ DJI Mic 2 的按键事件经 USB 是否稳定暴露给 macOS 因型号而异；�
 ```sh
 ./task/vad-voice-trigger --list-devices
 # 或
-"~/Library/Application Support/zhishuo/vad-voice-trigger" --list-devices
+"$HOME/Library/Application Support/zhishuo/vad-voice-trigger" --list-devices
 ```
 
 用实际名称重装：

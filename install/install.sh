@@ -192,13 +192,18 @@ mkdir -p -- "$INSTALL_DIR" "$LAUNCH_AGENTS_DIR" "$LOG_PARENT"
 USER_ID="$(id -u)"
 LAUNCH_DOMAIN="gui/$USER_ID"
 
-# --- Stop running agents before replacing files (fail hard if unload fails) ---
-stop_launch_agent "$LAUNCH_DOMAIN" "$LEGACY_LABEL"
-if [[ -f "$LEGACY_PLIST_PATH" ]]; then
-    print -r -- "Removing legacy plist: $LEGACY_PLIST_PATH"
-    rm -f -- "$LEGACY_PLIST_PATH"
+# --- Stop / migrate launchd only when we will manage the service ---
+# --no-start: install files only; do not bootout, remove loaded plists, or bootstrap.
+if (( START_SERVICE )); then
+    stop_launch_agent "$LAUNCH_DOMAIN" "$LEGACY_LABEL"
+    if [[ -f "$LEGACY_PLIST_PATH" ]]; then
+        print -r -- "Removing legacy plist: $LEGACY_PLIST_PATH"
+        rm -f -- "$LEGACY_PLIST_PATH"
+    fi
+    stop_launch_agent "$LAUNCH_DOMAIN" "$LABEL"
+else
+    print -r -- "--no-start: skipping launchd bootout/migration (running agents left untouched)."
 fi
-stop_launch_agent "$LAUNCH_DOMAIN" "$LABEL"
 
 # --- Install with rollback on failure ---
 if [[ -f "$BIN_PATH" ]]; then
