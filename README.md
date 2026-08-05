@@ -44,8 +44,8 @@
 ### 1. 克隆仓库
 
 ```sh
-git clone <repository-url>
-cd dji-mic-voice   # 或你的本地目录名
+git clone https://github.com/ythx-101/zhishuo.git
+cd zhishuo
 ```
 
 ### 2. 配置豆包输入法（必须先做）
@@ -131,13 +131,28 @@ security find-identity -v -p codesigning
 4. **未稳定签名时重新编译**会换 CDHash，旧授权可能失效 → 用 `./install/install.sh` 装到固定路径，并尽量 `--sign`。  
 5. **`--no-start` 不会触发麦克风弹窗**——只有进程真正访问麦克风时才会。  
 
-### 日志路径
+### 日志路径与日志级别
 
 默认日志：
 
 ```text
 ~/Library/Logs/zhishuo.log
 ```
+
+**默认只记录状态转换与错误**（如 `[VAD]` 起停、`[KEY]`、启动信息、stderr 错误）。  
+周期性电平行 `[LEVEL] … dBFS` 默认关闭；调试阈值时加 `--verbose`：
+
+```sh
+# 前台调试（含电平）
+"$HOME/Library/Application Support/zhishuo/vad-voice-trigger" \
+  --device "Wireless Mic Rx" --verbose
+
+# dry-run 调阈值时建议同时开 verbose
+./task/vad-voice-trigger --dry-run --device "Wireless Mic Rx" --verbose
+```
+
+常驻 LaunchAgent（`install.sh` 安装）**默认不带** `--verbose`，避免日志被电平刷屏。需要电平日志时，可编辑  
+`~/Library/LaunchAgents/com.zhishuo.vad.plist` 的 `ProgramArguments` 追加 `--verbose` 后重新 bootstrap。
 
 可用环境变量覆盖（安装前 export）：
 
@@ -275,6 +290,7 @@ tail -50 "$HOME/Library/Logs/zhishuo.log"
 
 ```text
 task/vad-voice-trigger.swift   主程序（VAD + 键鼠事件）
+task/hardware-listener.swift   可选：HID 硬件键探测（方案对照）
 install/install.sh             编译、签名、权限引导、launchd
 install/com.zhishuo.vad.plist  LaunchAgent 模板
 LICENSE                        MIT

@@ -119,6 +119,7 @@ private struct Configuration {
     var listDevices = false
     var selfTest = false
     var simulateVAD = false
+    var verbose = false
     var showHelp = false
 }
 
@@ -141,6 +142,7 @@ private func printUsage() {
           --auto-enter          Press Return after a successful stop (default: off).
           --auto-enter-delay-ms MS
                                 Wait before Return (default: 1200 ms).
+          --verbose             Print periodic [LEVEL] dBFS meter lines (default: off).
           --simulate-vad        With --dry-run, simulate speech then silence and exit.
           --self-test           Test VAD transitions without audio or permissions.
           --help                Show this help.
@@ -231,6 +233,9 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
                 option: argument
             )
             index += 2
+        case "--verbose", "-v":
+            configuration.verbose = true
+            index += 1
         case "--self-test":
             configuration.selfTest = true
             index += 1
@@ -707,6 +712,7 @@ private final class VADController: @unchecked Sendable {
     private let queue = DispatchQueue(label: "dji-mic-voice.vad")
     private let tapper: KeyboardTapper
     private let autoEnter: Bool
+    private let verbose: Bool
     private let onAudioStall: @Sendable (String) -> Void
     private var detector: VADDetector
     private var audioWatchdog = AudioCallbackWatchdog(timeoutSeconds: audioWatchdogSeconds)
@@ -730,6 +736,7 @@ private final class VADController: @unchecked Sendable {
         )
         self.tapper = tapper
         autoEnter = configuration.autoEnter
+        verbose = configuration.verbose
         self.onAudioStall = onAudioStall
 
         // One timer owns stop retries, maximum-session checks, and the audio
@@ -754,7 +761,7 @@ private final class VADController: @unchecked Sendable {
         queue.async { [self] in
             guard !isShuttingDown else { return }
             audioWatchdog.heartbeat(now: now)
-            if now - lastMeterPrintAt >= 0.25 {
+            if verbose, now - lastMeterPrintAt >= 0.25 {
                 let state = detector.isActive ? "recording" : "waiting"
                 print(String(format: "[LEVEL] %6.1f dBFS  %@", levelDB, state))
                 fflush(stdout)
