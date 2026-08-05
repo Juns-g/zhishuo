@@ -66,11 +66,10 @@ cd dji-mic-voice   # 或你的本地目录名
 安装器会依次：
 
 1. 编译 `task/vad-voice-trigger.swift` 并运行 `--self-test`；  
-2. 将二进制安装到固定路径：  
-   `~/Library/Application Support/zhishuo/vad-voice-trigger`；  
-3. 从 [install/com.zhishuo.vad.plist](install/com.zhishuo.vad.plist) 生成 LaunchAgent；  
-4. **引导**你在系统设置里为该固定路径开启 **辅助功能** 与 **麦克风**；  
-5. 启动服务 `com.zhishuo.vad`。
+2. 安全停掉旧服务（含历史 label `com.linyu.djimic-vad`；**bootout 失败则中止**，避免双进程）；  
+3. 将二进制与 LaunchAgent 装到固定路径（失败会回滚上一份文件）；  
+4. **默认启动** `com.zhishuo.vad`，让进程首次调用麦克风 `requestAccess`，弹出系统授权；  
+5. 再打开「麦克风 / 辅助功能」设置页，引导你**确认开关**（一般无需手动「+」添加二进制）。
 
 自定义设备名与自动回车延迟（毫秒）：
 
@@ -80,11 +79,16 @@ cd dji-mic-voice   # 或你的本地目录名
   --auto-enter-delay-ms 1200
 ```
 
-只装文件、不弹权限引导、不启动服务：
+只装文件、**不**加载 launchd、**不**触发麦克风系统弹窗：
 
 ```sh
 ./install/install.sh --no-permission-guide --no-start
 ```
+
+| 选项 | 含义 |
+| --- | --- |
+| `--no-start` | 只写入二进制与 `~/Library/LaunchAgents/com.zhishuo.vad.plist`，**不** `bootout`/`bootstrap`。不会触发 TCC 麦克风弹窗；需你稍后自行 `launchctl bootstrap` 或前台运行二进制。 |
+| `--no-permission-guide` | 不打开系统设置与说明对话框；与是否启动服务无关。 |
 
 ### 4. 签名（推荐，减少「重编就丢权限」）
 
@@ -108,23 +112,44 @@ security find-identity -v -p codesigning
 
 ### 路径固定
 
-授权对象必须是安装后的程序，而不是仓库里临时编出来的副本：
+运行与授权对象应是安装后的程序，而不是仓库里临时编出来的副本：
 
 ```text
 ~/Library/Application Support/zhishuo/vad-voice-trigger
 ```
 
-在 **系统设置 → 隐私与安全性** 中，用「+」添加上述路径，并打开开关。
+**推荐流程（安装器默认）：** 先 `bootstrap` 服务 → 系统弹出麦克风授权时点「好」→ 在设置页确认列表里该程序开关为开。麦克风条目通常在首次 `requestAccess` 后**自动出现**，不必依赖手动「+」。
+
+辅助功能：首次需要发键时系统也可能提示；若列表没有，再对上述固定路径点「+」。
 
 ### macOS TCC 坑（按「启动者 / 身份」授权）
 
 1. **按可执行文件（及代码签名）记账**，不是按「你觉得这是哪个 App」。  
    从 Terminal 直接跑、从 launchd 跑、从 Herdr 拉起，若路径或签名不同，系统可能当成不同主体，**反复弹权限**。  
-2. **只勾选 Terminal 不够**：launchd 启动的是上面的固定二进制，请给 **该二进制路径** 授权。  
-3. **改权限后**请退出并重开相关环境（或重新 `bootstrap` 服务），否则旧进程仍无权限。  
+2. **只勾选 Terminal 不够**：launchd 启动的是上面的固定二进制，请确认 **该二进制** 在麦克风/辅助功能列表中已允许。  
+3. **改权限后**请 `bootout`/`bootstrap` 或重开服务，否则旧进程仍无权限。  
 4. **未稳定签名时重新编译**会换 CDHash，旧授权可能失效 → 用 `./install/install.sh` 装到固定路径，并尽量 `--sign`。  
+5. **`--no-start` 不会触发麦克风弹窗**——只有进程真正访问麦克风时才会。  
 
-安装脚本会打开「辅助功能」「麦克风」设置页，并弹出对话框显示应添加的完整路径。
+### 日志路径
+
+默认日志：
+
+```text
+~/Library/Logs/zhishuo.log
+```
+
+可用环境变量覆盖（安装前 export）：
+
+| 变量 | 作用 |
+| --- | --- |
+| `ZHISHUO_LOG_PATH` | 日志文件完整路径（会自动 `mkdir -p` 其父目录） |
+| `ZHISHUO_INSTALL_DIR` | 安装目录（默认 `~/Library/Application Support/zhishuo`） |
+| `ZHISHUO_DEVICE_NAME` | 默认设备名 |
+| `ZHISHUO_AUTO_ENTER_DELAY_MS` | 默认自动回车延迟 |
+| `ZHISHUO_CODESIGN_IDENTITY` | 默认签名身份 |
+
+仍兼容旧前缀 `DJIMIC_*`。
 
 ## 使用说明
 
@@ -147,8 +172,8 @@ launchctl bootout gui/$(id -u) "$HOME/Library/LaunchAgents/com.zhishuo.vad.plist
 # 启动
 launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.zhishuo.vad.plist"
 
-# 日志
-tail -f "$HOME/Library/Logs/zhishuo.log"
+# 日志（若设置了 ZHISHUO_LOG_PATH 则用该路径）
+tail -f "${ZHISHUO_LOG_PATH:-$HOME/Library/Logs/zhishuo.log}"
 ```
 
 ### 手动编译 / 调试
@@ -183,7 +208,7 @@ swiftc \
 | `--auto-enter-delay-ms MS` | `--auto-enter-delay-ms MS` | 同左（默认 1200） |
 
 LaunchAgent Label：`com.zhishuo.vad`  
-环境变量（可选）：`ZHISHUO_INSTALL_DIR`、`ZHISHUO_DEVICE_NAME`、`ZHISHUO_AUTO_ENTER_DELAY_MS`、`ZHISHUO_CODESIGN_IDENTITY`（仍兼容旧前缀 `DJIMIC_*`）。
+环境变量（可选）：`ZHISHUO_INSTALL_DIR`、`ZHISHUO_LOG_PATH`、`ZHISHUO_DEVICE_NAME`、`ZHISHUO_AUTO_ENTER_DELAY_MS`、`ZHISHUO_CODESIGN_IDENTITY`（仍兼容旧前缀 `DJIMIC_*`）。
 
 ## FAQ
 
