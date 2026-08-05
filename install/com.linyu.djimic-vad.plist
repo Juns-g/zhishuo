@@ -7,16 +7,16 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>~/projects/dji-mic-voice/task/vad-voice-trigger</string>
+        <string>__PROGRAM_PATH__</string>
         <string>--device</string>
-        <string>Wireless Mic Rx</string>
+        <string>__DEVICE_NAME__</string>
         <string>--auto-enter</string>
         <string>--auto-enter-delay-ms</string>
-        <string>1200</string>
+        <string>__AUTO_ENTER_DELAY_MS__</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>~/projects/dji-mic-voice</string>
+    <string>__WORKING_DIRECTORY__</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -31,9 +31,10 @@
     <integer>5</integer>
 
     <key>StandardOutPath</key>
-    <string>~/Library/Logs/djimic-vad.log</string>
+    <string>__LOG_PATH__</string>
 
     <key>StandardErrorPath</key>
-    <string>~/Library/Logs/djimic-vad.log</string>
+    <string>__LOG_PATH__</string>
 </dict>
 </plist>
+

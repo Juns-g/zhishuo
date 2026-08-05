@@ -1,0 +1,9 @@
+.DS_Store
+
+# Local build products
+/task/hardware-listener
+/task/vad-voice-trigger
+
+# Machine-specific SOP discovery output
+/task/roster.json
+
