@@ -9,6 +9,11 @@
  - Starts after sustained speech, then clicks Right Option once.
  - Clicks Right Option again after 0.8-1.2 seconds of silence or at the
    configured maximum recording time.
+ - With --key-mode fn-hold, holds Fn for speech and releases it at stop
+   instead (for existing WeType hold-Fn dictation); --auto-enter is rejected.
+ - With --run-seconds SEC, exits through normal shutdown after SEC of listening.
+ - The com.juns.zhishuo.trial app defaults to fn-hold and 60 seconds;
+   the standalone CLI defaults to right-option-toggle and no run limit.
  - With --auto-enter, presses Return after a successful stop so the focused
    composer can send the completed transcription.
  - Uses an energy-based VAD with separate start/stop thresholds, hysteresis,
@@ -30,7 +35,7 @@
  Build and run from the repository root
  --------------------------------------
    swiftc -framework AVFoundation -framework AVFAudio -framework CoreAudio \
-     -framework AudioToolbox -framework CoreGraphics \
+     -framework AudioToolbox -framework CoreMedia -framework CoreGraphics \
      -framework ApplicationServices \
      task/vad-voice-trigger.swift -o task/vad-voice-trigger
 
@@ -56,6 +61,8 @@
  threshold (for example, from -42 to -36). If normal speech is missed, lower
  it. Keep --silence-ms between 800 and 1200 as required by this workflow.
  Use --dry-run --simulate-vad for a hardware-independent start-to-stop check.
+ --simulate-vad uses synthetic time and exits on its simulated silence;
+ --run-seconds bounds live listening, not this offline simulation.
 
  Permissions
  -----------
@@ -80,17 +87,20 @@ import AVFAudio
 import AVFoundation
 import CoreAudio
 import CoreGraphics
+import CoreMedia
 import Darwin
 import Foundation
 
 private let defaultDJIDeviceName = "Wireless Mic Rx"
 private let rightOptionKeyCode: CGKeyCode = 61
+private let fnKeyCode: CGKeyCode = 63
 private let returnKeyCode: CGKeyCode = 36
 private let defaultAutoEnterDelayMilliseconds = 1_200.0
 private let minimumSilenceMilliseconds = 800.0
 private let maximumSilenceMilliseconds = 1_200.0
 private let audioWatchdogSeconds = 1.5
 private let stopRetrySeconds = 0.25
+private let isTrialApp = Bundle.main.bundleIdentifier == "com.juns.zhishuo.trial"
 
 private struct UserError: Error, CustomStringConvertible {
     let description: String
@@ -105,6 +115,11 @@ private enum DeviceSelection {
     case systemDefault
 }
 
+private enum KeyMode: String {
+    case fnHold = "fn-hold"
+    case rightOptionToggle = "right-option-toggle"
+}
+
 private struct Configuration {
     var deviceSelection: DeviceSelection = .named(defaultDJIDeviceName)
     var startThresholdDB = -40.0
@@ -113,6 +128,8 @@ private struct Configuration {
     var silenceMilliseconds = 1_000.0
     var cooldownMilliseconds = 700.0
     var maxSessionSeconds = 120.0
+    var runSeconds: Double? = isTrialApp ? 60 : nil
+    var keyMode: KeyMode = isTrialApp ? .fnHold : .rightOptionToggle
     var dryRun = false
     var autoEnter = false
     var autoEnterDelayMilliseconds = defaultAutoEnterDelayMilliseconds
@@ -124,6 +141,8 @@ private struct Configuration {
 }
 
 private func printUsage() {
+    let defaults = Configuration()
+    let runLimit = defaults.runSeconds.map { "\(Int($0)) s" } ?? "no limit"
     print(
         """
         Usage: vad-voice-trigger [options]
@@ -138,8 +157,11 @@ private func printUsage() {
           --silence-ms MS       Silence before stopping, 800-1200 (default: 1000 ms).
           --cooldown-ms MS      Post-stop debounce window (default: 700 ms).
           --max-seconds SEC     Failsafe recording timeout (default: 120 s).
+          --run-seconds SEC|unlimited
+                                Positive listening seconds, or unlimited (default: \(runLimit)).
+          --key-mode MODE       fn-hold or right-option-toggle (default: \(defaults.keyMode.rawValue)).
           --dry-run             Print VAD actions without sending keyboard events.
-          --auto-enter          Press Return after a successful stop (default: off).
+          --auto-enter          Press Return after stop (default: off; incompatible with fn-hold).
           --auto-enter-delay-ms MS
                                 Wait before Return (default: 1200 ms).
           --verbose             Print periodic [LEVEL] dBFS meter lines (default: off).
@@ -221,6 +243,21 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
                 option: argument
             )
             index += 2
+        case "--run-seconds":
+            let value = try requiredValue(after: argument)
+            if value == "unlimited" {
+                configuration.runSeconds = nil
+            } else {
+                configuration.runSeconds = try parseDouble(value, option: argument)
+            }
+            index += 2
+        case "--key-mode":
+            let value = try requiredValue(after: argument)
+            guard let mode = KeyMode(rawValue: value) else {
+                throw UserError("--key-mode must be fn-hold or right-option-toggle.")
+            }
+            configuration.keyMode = mode
+            index += 2
         case "--dry-run":
             configuration.dryRun = true
             index += 1
@@ -268,6 +305,12 @@ private func parseArguments(_ arguments: [String]) throws -> Configuration {
     }
     guard configuration.maxSessionSeconds > 0 else {
         throw UserError("--max-seconds must be greater than 0.")
+    }
+    if let runSeconds = configuration.runSeconds, runSeconds <= 0 {
+        throw UserError("--run-seconds must be greater than 0.")
+    }
+    guard configuration.keyMode != .fnHold || !configuration.autoEnter else {
+        throw UserError("--auto-enter is incompatible with --key-mode fn-hold.")
     }
     guard configuration.autoEnterDelayMilliseconds >= 0 else {
         throw UserError("--auto-enter-delay-ms must be at least 0.")
@@ -337,6 +380,21 @@ private func audioDeviceName(_ deviceID: AudioDeviceID) throws -> String {
         throw UserError("Unable to read audio device \(deviceID) name (CoreAudio \(coreAudioStatus(status))).")
     }
     return unmanagedName.takeUnretainedValue() as String
+}
+
+private func audioDeviceUID(_ deviceID: AudioDeviceID) throws -> String {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceUID,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+    var uid: Unmanaged<CFString>?
+    var size = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    let status = AudioObjectGetPropertyData(deviceID, &address, 0, nil, &size, &uid)
+    guard status == noErr, let uid else {
+        throw UserError("Unable to read audio device \(deviceID) UID (CoreAudio \(coreAudioStatus(status))).")
+    }
+    return uid.takeUnretainedValue() as String
 }
 
 private func inputChannelCount(_ deviceID: AudioDeviceID) throws -> UInt32 {
@@ -630,11 +688,58 @@ private struct AudioCallbackWatchdog {
 
 private final class KeyboardTapper: @unchecked Sendable {
     private let dryRun: Bool
+    private let keyMode: KeyMode
     private let autoEnterDelayMilliseconds: Double
+    private var fnReleaseEvent: CGEvent?
+    private(set) var isFnHeld = false
 
-    init(dryRun: Bool, autoEnterDelayMilliseconds: Double) {
+    init(dryRun: Bool, keyMode: KeyMode, autoEnterDelayMilliseconds: Double) {
         self.dryRun = dryRun
+        self.keyMode = keyMode
         self.autoEnterDelayMilliseconds = autoEnterDelayMilliseconds
+    }
+
+    // Match SayAll v1.9.21 postKeyState; macOS makes modifier events flagsChanged.
+    static func makeFnEvents() -> (down: CGEvent, up: CGEvent)? {
+        guard let source = CGEventSource(stateID: .hidSystemState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: fnKeyCode, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: fnKeyCode, keyDown: false)
+        else { return nil }
+        down.flags = .maskSecondaryFn
+        up.flags = []
+        return (down, up)
+    }
+
+    func startVoice(context: String) -> Bool {
+        guard keyMode == .fnHold else { return tapRightOption(context: context) }
+        guard !isFnHeld else { return true }
+        if !dryRun {
+            guard let events = Self.makeFnEvents() else {
+                fputs("Unable to create paired Fn CGEvents.\n", stderr)
+                return false
+            }
+            // Allocate the release before posting down, so cleanup needs no new event.
+            fnReleaseEvent = events.up
+            events.down.post(tap: .cghidEventTap)
+        }
+        isFnHeld = true
+        print("[\(dryRun ? "DRY RUN" : "KEY")] Fn down (keycode 63, maskSecondaryFn): \(context)")
+        fflush(stdout)
+        return true
+    }
+
+    func stopVoice(context: String) -> Bool {
+        guard keyMode == .fnHold else { return tapRightOption(context: context) }
+        guard isFnHeld else { return true }
+        if !dryRun {
+            guard let event = fnReleaseEvent else { return false }
+            event.post(tap: .cghidEventTap)
+        }
+        fnReleaseEvent = nil
+        isFnHeld = false
+        print("[\(dryRun ? "DRY RUN" : "KEY")] Fn up (keycode 63, flags cleared): \(context)")
+        fflush(stdout)
+        return true
     }
 
     func tapRightOption(context: String) -> Bool {
@@ -672,6 +777,7 @@ private final class KeyboardTapper: @unchecked Sendable {
     }
 
     func tapReturn(context: String) -> Bool {
+        guard keyMode != .fnHold else { return false }
         if dryRun {
             print("[DRY RUN] Return click: \(context)")
             fflush(stdout)
@@ -740,7 +846,7 @@ private final class VADController: @unchecked Sendable {
         self.onAudioStall = onAudioStall
 
         // One timer owns stop retries, maximum-session checks, and the audio
-        // callback watchdog. It runs independently of AVAudioEngine callbacks.
+        // callback watchdog. It runs independently of audio capture callbacks.
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [weak self] in
@@ -819,15 +925,15 @@ private final class VADController: @unchecked Sendable {
     private func handle(_ action: VADAction, now: Double) {
         switch action {
         case .start:
-            print("[VAD] Sustained speech detected; starting Doubao voice input.")
-            if !tapper.tapRightOption(context: "start") {
+            print("[VAD] Sustained speech detected; starting voice input.")
+            if !tapper.startVoice(context: "start") {
                 detector.cancelFailedStart(now: now)
                 fputs("Start click failed; VAD returned to waiting state.\n", stderr)
             }
         case .stop(let reason):
-            print("[VAD] Stopping Doubao voice input: \(reason).")
+            print("[VAD] Stopping voice input: \(reason).")
             lastStopAttemptAt = now
-            if tapper.tapRightOption(context: "stop") {
+            if tapper.stopVoice(context: "stop (\(reason))") {
                 detector.confirmStop(now: now)
                 print("[VAD] Stop confirmed; returned to waiting state.")
                 if autoEnter,
@@ -848,57 +954,83 @@ private final class VADController: @unchecked Sendable {
     }
 }
 
-private final class AudioMonitor: @unchecked Sendable {
-    private let engine = AVAudioEngine()
+private final class AudioMonitor: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
+    private let session = AVCaptureSession()
+    private let output = AVCaptureAudioDataOutput()
     private let controlQueue = DispatchQueue(label: "dji-mic-voice.audio-control")
-    private var tapInstalled = false
+    private let sampleQueue = DispatchQueue(label: "dji-mic-voice.audio-samples")
+    private let onFailure: @Sendable (String) -> Void
+    // Only sampleQueue reads or writes callback state.
+    private var controller: VADController?
+    private var failed = false
+
+    init(onFailure: @escaping @Sendable (String) -> Void) {
+        self.onFailure = onFailure
+        super.init()
+    }
 
     func start(device: AudioInputDevice, controller: VADController) throws -> AVAudioFormat {
         try controlQueue.sync {
-            let inputNode = engine.inputNode
-            guard let audioUnit = inputNode.audioUnit else {
-                throw UserError("AVAudioEngine did not provide an input AudioUnit.")
-            }
-
-            var deviceID = device.id
-            let status = AudioUnitSetProperty(
-                audioUnit,
-                kAudioOutputUnitProperty_CurrentDevice,
-                kAudioUnitScope_Global,
-                0,
-                &deviceID,
-                UInt32(MemoryLayout<AudioDeviceID>.size)
-            )
-            guard status == noErr else {
+            let uid = try audioDeviceUID(device.id)
+            guard !uid.isEmpty,
+                  let captureDevice = AVCaptureDevice(uniqueID: uid),
+                  captureDevice.uniqueID == uid, captureDevice.hasMediaType(.audio),
+                  captureDevice.isConnected else {
                 throw UserError(
-                    "Unable to select \"\(device.name)\" in AVAudioEngine "
-                        + "(AudioUnit \(coreAudioStatus(status)))."
+                    "No connected AVCapture audio device matches \"\(device.name)\" "
+                        + "(CoreAudio id=\(device.id), UID=\(uid)); no other input was substituted."
                 )
             }
-
-            let format = inputNode.outputFormat(forBus: 0)
-            guard format.sampleRate > 0, format.channelCount > 0 else {
-                throw UserError("Selected input has an invalid audio format: \(format).")
+            let input = try AVCaptureDeviceInput(device: captureDevice)
+            guard let native = CMAudioFormatDescriptionGetStreamBasicDescription(
+                captureDevice.activeFormat.formatDescription
+            )?.pointee,
+                  native.mSampleRate.isFinite, native.mSampleRate > 0,
+                  native.mChannelsPerFrame > 0,
+                  let format = AVAudioFormat(
+                      commonFormat: .pcmFormatFloat32,
+                      sampleRate: native.mSampleRate,
+                      channels: native.mChannelsPerFrame,
+                      interleaved: true
+                  ) else {
+                throw UserError("AVCapture input has no valid native audio format.")
             }
 
-            inputNode.installTap(onBus: 0, bufferSize: 1_024, format: format) {
-                buffer,
-                _ in
-                let level = Self.levelDBFS(buffer)
-                let duration = Double(buffer.frameLength) / format.sampleRate
-                controller.accept(levelDB: level, duration: duration)
-            }
-            tapInstalled = true
-
-            engine.prepare()
+            session.beginConfiguration()
             do {
-                try engine.start()
-            } catch {
-                // The tap was installed before engine.start(), so unwind it
-                // before surfacing the startup error.
-                inputNode.removeTap(onBus: 0)
-                tapInstalled = false
-                throw UserError("AVAudioEngine failed to start: \(error.localizedDescription)")
+                defer { session.commitConfiguration() }
+                guard session.canAddInput(input) else {
+                    throw UserError("AVCaptureSession cannot add the selected audio input.")
+                }
+                session.addInput(input)
+                guard session.canAddOutput(output) else {
+                    throw UserError("AVCaptureSession cannot add audio data output.")
+                }
+                session.addOutput(output)
+                output.audioSettings = [
+                    AVFormatIDKey: kAudioFormatLinearPCM,
+                    AVSampleRateKey: native.mSampleRate,
+                    AVNumberOfChannelsKey: native.mChannelsPerFrame,
+                    AVLinearPCMBitDepthKey: 32,
+                    AVLinearPCMIsFloatKey: true,
+                    AVLinearPCMIsBigEndianKey: false,
+                    AVLinearPCMIsNonInterleaved: false,
+                ]
+            }
+            sampleQueue.sync {
+                self.controller = controller
+                failed = false
+            }
+            output.setSampleBufferDelegate(self, queue: sampleQueue)
+            print(
+                "[AUDIO] AVCaptureSession input=\"\(captureDevice.localizedName)\", UID=\(uid) "
+                    + "(exact CoreAudio UID match); requesting interleaved Float32 PCM, "
+                    + "\(native.mChannelsPerFrame) ch, \(native.mSampleRate) Hz."
+            )
+            fflush(stdout)
+            session.startRunning()
+            guard session.isRunning else {
+                throw UserError("AVCaptureSession failed to start the selected audio input.")
             }
             return format
         }
@@ -906,40 +1038,92 @@ private final class AudioMonitor: @unchecked Sendable {
 
     func stop() {
         controlQueue.sync {
-            // AVAudioEngine graph changes are serialized here. Remove the tap
-            // exactly once before stopping the engine so no callback can race
-            // a second removeTap/stop sequence.
-            if tapInstalled {
-                engine.inputNode.removeTap(onBus: 0)
-                tapInstalled = false
+            output.setSampleBufferDelegate(nil, queue: nil)
+            session.stopRunning()
+            // Drain in-flight callbacks before releasing the controller and input.
+            sampleQueue.sync {
+                controller = nil
+                failed = true
             }
-            if engine.isRunning {
-                engine.stop()
-            }
+            for input in session.inputs { session.removeInput(input) }
+            for output in session.outputs { session.removeOutput(output) }
         }
     }
 
-    private static func levelDBFS(_ buffer: AVAudioPCMBuffer) -> Double {
-        guard let channelData = buffer.floatChannelData,
-              buffer.frameLength > 0,
-              buffer.format.channelCount > 0 else {
-            return -120
+    func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        guard let controller, !failed else { return }
+        do {
+            let audio = try Self.levelAndDuration(sampleBuffer)
+            controller.accept(levelDB: audio.levelDB, duration: audio.duration)
+        } catch {
+            failed = true
+            let message = "AVCapture audio callback failed: \(error)"
+            fputs("ERROR: \(message)\n", stderr)
+            onFailure(message)
         }
+    }
 
-        let frameCount = Int(buffer.frameLength)
-        let channelCount = Int(buffer.format.channelCount)
-        var sumSquares = 0.0
-        for channel in 0..<channelCount {
-            let samples = channelData[channel]
-            for frame in 0..<frameCount {
-                let sample = Double(samples[frame])
+    static func levelAndDuration(_ sampleBuffer: CMSampleBuffer) throws -> (levelDB: Double, duration: Double) {
+        guard CMSampleBufferDataIsReady(sampleBuffer),
+              let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let format = CMAudioFormatDescriptionGetStreamBasicDescription(description)?.pointee else {
+            throw UserError("Missing ready PCM audio data or format description.")
+        }
+        let flags = format.mFormatFlags
+        guard format.mFormatID == kAudioFormatLinearPCM,
+              flags & kAudioFormatFlagIsFloat != 0,
+              flags & kAudioFormatFlagIsPacked != 0,
+              flags & (kAudioFormatFlagIsBigEndian | kAudioFormatFlagIsNonInterleaved) == 0,
+              format.mBitsPerChannel == 32,
+              format.mChannelsPerFrame > 0, format.mChannelsPerFrame <= UInt32.max / 4,
+              format.mBytesPerFrame == format.mChannelsPerFrame * 4,
+              format.mFramesPerPacket == 1, format.mBytesPerPacket == format.mBytesPerFrame,
+              format.mSampleRate.isFinite, format.mSampleRate > 0 else {
+            throw UserError(
+                "Expected packed interleaved little-endian Float32 PCM; received "
+                    + "format=\(format.mFormatID), flags=\(flags), bits=\(format.mBitsPerChannel), "
+                    + "channels=\(format.mChannelsPerFrame), rate=\(format.mSampleRate)."
+            )
+        }
+        let frames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard frames > 0, frames <= Int.max / Int(format.mBytesPerFrame) else {
+            throw UserError("AVCapture supplied an empty or oversized PCM buffer.")
+        }
+        // Interleaved PCM has one AudioBuffer. CoreMedia retains and aligns its data.
+        var buffers = AudioBufferList()
+        var retainedBlock: CMBlockBuffer?
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: &buffers,
+            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            blockBufferAllocator: kCFAllocatorDefault,
+            blockBufferMemoryAllocator: kCFAllocatorDefault,
+            flags: UInt32(kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment),
+            blockBufferOut: &retainedBlock
+        )
+        guard status == noErr, buffers.mNumberBuffers == 1,
+              buffers.mBuffers.mNumberChannels == format.mChannelsPerFrame,
+              Int(buffers.mBuffers.mDataByteSize) == frames * Int(format.mBytesPerFrame),
+              let data = buffers.mBuffers.mData else {
+            throw UserError("Invalid interleaved PCM buffer layout (CoreMedia \(status)).")
+        }
+        return try withExtendedLifetime(retainedBlock) {
+            let count = frames * Int(format.mChannelsPerFrame)
+            let samples = data.assumingMemoryBound(to: Float.self)
+            var sumSquares = 0.0
+            for index in 0..<count {
+                let sample = Double(samples[index])
+                guard sample.isFinite else { throw UserError("Non-finite PCM sample received.") }
                 sumSquares += sample * sample
             }
+            let rms = sqrt(sumSquares / Double(count))
+            return (max(-120, 20 * log10(max(rms, 0.000_001))), Double(frames) / format.mSampleRate)
         }
-
-        let sampleCount = Double(frameCount * channelCount)
-        let rms = sqrt(sumSquares / sampleCount)
-        return max(-120, 20 * log10(max(rms, 0.000_001)))
     }
 }
 
@@ -1004,10 +1188,15 @@ private func hasAccessibilityPermission(prompt: Bool) -> Bool {
 private func runSelfTest() throws {
     let defaultConfiguration = try parseArguments([])
     let autoEnterConfiguration = try parseArguments([
+        "--key-mode", "right-option-toggle", "--run-seconds", "5",
         "--auto-enter", "--auto-enter-delay-ms", "1750",
     ])
     guard !defaultConfiguration.autoEnter,
+          defaultConfiguration.keyMode == (isTrialApp ? .fnHold : .rightOptionToggle),
+          defaultConfiguration.runSeconds == (isTrialApp ? 60 : nil),
           defaultConfiguration.autoEnterDelayMilliseconds == 1_200,
+          autoEnterConfiguration.keyMode == .rightOptionToggle,
+          autoEnterConfiguration.runSeconds == 5,
           autoEnterConfiguration.autoEnter,
           autoEnterConfiguration.autoEnterDelayMilliseconds == 1_750 else {
         throw UserError("SELF-TEST FAIL: auto-enter parsing/default is incorrect.")
@@ -1020,6 +1209,53 @@ private func runSelfTest() throws {
     }
     guard rejectedNegativeAutoEnterDelay else {
         throw UserError("SELF-TEST FAIL: negative auto-enter delay was accepted.")
+    }
+
+    var fnConfiguration = try parseArguments(["--key-mode", "fn-hold", "--run-seconds", "0.5"])
+    guard fnConfiguration.keyMode == .fnHold, fnConfiguration.runSeconds == 0.5,
+          !fnConfiguration.autoEnter else {
+        throw UserError("SELF-TEST FAIL: Fn/run limit parsing is incorrect.")
+    }
+    let unlimitedConfiguration = try parseArguments(["--run-seconds", "unlimited"])
+    guard unlimitedConfiguration.runSeconds == nil else {
+        throw UserError("SELF-TEST FAIL: explicit unlimited run limit was not applied.")
+    }
+    for arguments in [
+        ["--key-mode", "unknown"], ["--key-mode"],
+        ["--key-mode", "fn-hold", "--auto-enter"],
+        ["--auto-enter", "--key-mode", "fn-hold"],
+        ["--run-seconds", "0"], ["--run-seconds", "-1"],
+        ["--run-seconds", "nan"], ["--run-seconds", "inf"], ["--run-seconds"],
+    ] {
+        var rejected = false
+        do { _ = try parseArguments(arguments) } catch { rejected = true }
+        guard rejected else {
+            throw UserError("SELF-TEST FAIL: invalid arguments accepted: \(arguments).")
+        }
+    }
+
+    // Construct and inspect events only; self-test never posts them.
+    guard let fnEvents = KeyboardTapper.makeFnEvents(),
+          fnEvents.down.getIntegerValueField(.keyboardEventKeycode) == 63,
+          fnEvents.up.getIntegerValueField(.keyboardEventKeycode) == 63,
+          fnEvents.down.type == .flagsChanged, fnEvents.up.type == .flagsChanged,
+          fnEvents.down.flags == .maskSecondaryFn, fnEvents.up.flags.isEmpty else {
+        throw UserError("SELF-TEST FAIL: Fn event codes/types/flags are incorrect.")
+    }
+    let fnTapper = KeyboardTapper(dryRun: true, keyMode: .fnHold, autoEnterDelayMilliseconds: 0)
+    guard fnTapper.startVoice(context: "self-test"), fnTapper.isFnHeld,
+          fnTapper.stopVoice(context: "self-test"), !fnTapper.isFnHeld,
+          fnTapper.stopVoice(context: "already released"),
+          !fnTapper.tapReturn(context: "forbidden in fn-hold") else {
+        throw UserError("SELF-TEST FAIL: Fn pairing or Return guard failed.")
+    }
+    fnConfiguration.startMilliseconds = 50
+    let fnController = VADController(configuration: fnConfiguration, tapper: fnTapper,
+                                     onAudioStall: { _ in })
+    fnController.accept(levelDB: -20, duration: 0.05)
+    fnController.shutdown()
+    guard !fnTapper.isFnHeld else {
+        throw UserError("SELF-TEST FAIL: shutdown left Fn held.")
     }
 
     var detector = VADDetector(
@@ -1125,7 +1361,48 @@ private func runSelfTest() throws {
         throw UserError("SELF-TEST FAIL: audio-device selection is incorrect.")
     }
 
+    // Exercise the real callback decoder with synthetic stereo PCM, without a capture session.
+    func pcmFixture(_ samples: [Float]) throws -> CMSampleBuffer {
+        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                   channels: 2, interleaved: true)!
+        let byteCount = samples.count * MemoryLayout<Float>.size
+        var block: CMBlockBuffer?
+        let allocationStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: byteCount,
+            blockAllocator: kCFAllocatorDefault, customBlockSource: nil,
+            offsetToData: 0, dataLength: byteCount, flags: 0, blockBufferOut: &block
+        )
+        guard allocationStatus == noErr, let block else {
+            throw UserError("SELF-TEST FAIL: PCM fixture allocation failed (\(allocationStatus)).")
+        }
+        let copyStatus = samples.withUnsafeBytes {
+            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: block,
+                                          offsetIntoDestination: 0, dataLength: byteCount)
+        }
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: 48_000),
+                                        presentationTimeStamp: .zero, decodeTimeStamp: .invalid)
+        var bytesPerFrame = 2 * MemoryLayout<Float>.size
+        var buffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateReady(
+            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: format.formatDescription,
+            sampleCount: samples.count / 2, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+            sampleSizeEntryCount: 1, sampleSizeArray: &bytesPerFrame, sampleBufferOut: &buffer
+        )
+        guard copyStatus == noErr, status == noErr, let buffer else {
+            throw UserError("SELF-TEST FAIL: PCM fixture creation failed (\(copyStatus), \(status)).")
+        }
+        return buffer
+    }
+    let pcm = try AudioMonitor.levelAndDuration(pcmFixture([0.5, -0.5, 0, 0]))
+    let silence = try AudioMonitor.levelAndDuration(pcmFixture([0, 0, 0, 0]))
+    guard abs(pcm.levelDB - (-9.0308998699)) < 0.000001,
+          abs(pcm.duration - 2.0 / 48_000) < 0.000000001,
+          silence.levelDB == -120, silence.duration == pcm.duration else {
+        throw UserError("SELF-TEST FAIL: interleaved PCM RMS, silence floor or duration is incorrect.")
+    }
+
     guard rightOptionKeyCode == 61,
+          fnKeyCode == 63,
           returnKeyCode == 36,
           defaultAutoEnterDelayMilliseconds == 1_200,
           minimumSilenceMilliseconds == 800,
@@ -1134,9 +1411,16 @@ private func runSelfTest() throws {
     }
 
     print(
-        "SELF-TEST PASS: device selection, start cleanup, retained/retried stop, "
+        "SELF-TEST DEFAULTS: key-mode=\(defaultConfiguration.keyMode.rawValue), "
+            + "run-seconds=\(defaultConfiguration.runSeconds.map { String($0) } ?? "unlimited"), "
+            + "auto-enter=\(defaultConfiguration.autoEnter)."
+    )
+    print(
+        "SELF-TEST PASS: stereo Float32 CMSampleBuffer RMS/silence/duration, "
+            + "device selection, start cleanup, retained/retried stop, "
             + "silence stop, debounce, 1.5 s audio watchdog, session timeout, "
-            + "auto-enter delay parsing/default/rejection, and key codes 61/36."
+            + "auto-enter delay parsing/default/rejection, Fn paired down/up and shutdown release, "
+            + "run limit parsing/rejection, and key codes 61/63/36 (no events posted)."
     )
 }
 
@@ -1151,6 +1435,7 @@ private func runDryRunSimulation(configuration: Configuration) throws {
     )
     let tapper = KeyboardTapper(
         dryRun: true,
+        keyMode: configuration.keyMode,
         autoEnterDelayMilliseconds: configuration.autoEnterDelayMilliseconds
     )
     let frameSeconds = 0.05
@@ -1165,7 +1450,7 @@ private func runDryRunSimulation(configuration: Configuration) throws {
             duration: frameSeconds,
             now: now
         ) == .start {
-            guard tapper.tapRightOption(context: "start") else {
+            guard tapper.startVoice(context: "start") else {
                 detector.cancelFailedStart(now: now)
                 throw UserError("DRY-RUN FAIL: simulated start click failed.")
             }
@@ -1181,7 +1466,7 @@ private func runDryRunSimulation(configuration: Configuration) throws {
             duration: frameSeconds,
             now: now
         ) {
-            guard tapper.tapRightOption(context: "stop") else {
+            guard tapper.stopVoice(context: "stop") else {
                 throw UserError("DRY-RUN FAIL: simulated stop click failed.")
             }
             detector.confirmStop(now: now)
@@ -1196,6 +1481,7 @@ private func runDryRunSimulation(configuration: Configuration) throws {
 
     guard startCount == 1,
           stopCount == 1,
+          !tapper.isFnHeld,
           !detector.isActive,
           detector.pendingStopReason == nil else {
         throw UserError(
@@ -1239,7 +1525,7 @@ do {
     }
     if !configuration.dryRun, !hasAccessibilityPermission(prompt: true) {
         throw UserError(
-            "Accessibility access is required to click Right Option. Allow the launcher in "
+            "Accessibility access is required to post the voice shortcut. Allow the launcher in "
                 + "System Settings > Privacy & Security > Accessibility, restart it, and run again."
         )
     }
@@ -1247,6 +1533,7 @@ do {
     let runtimeExitState = RuntimeExitState()
     let tapper = KeyboardTapper(
         dryRun: configuration.dryRun,
+        keyMode: configuration.keyMode,
         autoEnterDelayMilliseconds: configuration.autoEnterDelayMilliseconds
     )
     let controller = VADController(
@@ -1258,37 +1545,10 @@ do {
             _ = kill(getpid(), SIGTERM)
         }
     )
-    let monitor = AudioMonitor()
-    let format = try monitor.start(device: selectedDevice, controller: controller)
-    controller.beginAudioWatchdog()
-
-    print(
-        "Listening to \"\(selectedDevice.name)\" "
-            + "(id=\(selectedDevice.id), \(Int(format.channelCount)) ch, "
-            + "\(Int(format.sampleRate)) Hz)."
-    )
-    print(
-        String(
-            format: "VAD: start %.1f dBFS for %.0f ms; stop below %.1f dBFS for %.0f ms; max %.0f s.%@",
-            configuration.startThresholdDB,
-            configuration.startMilliseconds,
-            configuration.stopThresholdDB,
-            configuration.silenceMilliseconds,
-            configuration.maxSessionSeconds,
-            configuration.dryRun ? " DRY RUN." : ""
-        )
-    )
-    if configuration.autoEnter {
-        print(
-            String(
-                format: "Auto-enter is ON: Return will be pressed %.0f ms after each successful stop.",
-                configuration.autoEnterDelayMilliseconds
-            )
-        )
-    }
-    print("Press Control-C to stop safely.")
-    fflush(stdout)
-
+    let monitor = AudioMonitor(onFailure: { message in
+        runtimeExitState.fail(message)
+        _ = kill(getpid(), SIGTERM)
+    })
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
     let signalQueue = DispatchQueue(label: "dji-mic-voice.signals")
@@ -1311,7 +1571,63 @@ do {
     terminateSource.setEventHandler(handler: shutdown)
     interruptSource.resume()
     terminateSource.resume()
-    dispatchMain()
+
+    let format: AVAudioFormat
+    do {
+        format = try monitor.start(device: selectedDevice, controller: controller)
+    } catch {
+        controller.shutdown()
+        monitor.stop()
+        throw error
+    }
+    controller.beginAudioWatchdog()
+
+    print(
+        "Listening to \"\(selectedDevice.name)\" "
+            + "(id=\(selectedDevice.id), \(Int(format.channelCount)) ch, "
+            + "\(Int(format.sampleRate)) Hz)."
+    )
+    print("Key mode: \(configuration.keyMode.rawValue).")
+    print(
+        String(
+            format: "VAD: start %.1f dBFS for %.0f ms; stop below %.1f dBFS for %.0f ms; max %.0f s.%@",
+            configuration.startThresholdDB,
+            configuration.startMilliseconds,
+            configuration.stopThresholdDB,
+            configuration.silenceMilliseconds,
+            configuration.maxSessionSeconds,
+            configuration.dryRun ? " DRY RUN." : ""
+        )
+    )
+    if configuration.autoEnter {
+        print(
+            String(
+                format: "Auto-enter is ON: Return will be pressed %.0f ms after each successful stop.",
+                configuration.autoEnterDelayMilliseconds
+            )
+        )
+    }
+    // Use the same serialized cleanup as SIGTERM, including release of a held Fn.
+    let runTimer: DispatchSourceTimer?
+    if let seconds = configuration.runSeconds {
+        let timer = DispatchSource.makeTimerSource(queue: signalQueue)
+        timer.schedule(deadline: .now() + seconds)
+        timer.setEventHandler {
+            print("[RUN LIMIT] Trial listening time elapsed.")
+            shutdown()
+        }
+        timer.resume()
+        runTimer = timer
+        print("Run limit: \(seconds) seconds of listening.")
+    } else {
+        runTimer = nil
+    }
+    print("Press Control-C to stop safely.")
+    fflush(stdout)
+    // Keep dispatch sources alive until process exit.
+    withExtendedLifetime((interruptSource, terminateSource, runTimer)) {
+        dispatchMain()
+    }
 } catch {
     fputs("ERROR: \(error)\n", stderr)
     fputs("Run with --help for usage.\n", stderr)

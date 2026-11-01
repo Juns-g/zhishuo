@@ -1,309 +1,58 @@
-# 直说 ZhiShuo
+# 直说 ZhiShuo · Fn 语音输入适配
 
-**拿起 DJI Mic，直接说话，自动转录发送。**
+中文 | [English](README.en.md)
 
-本机用 DJI 无线麦的实时音量做声控（VAD）：检测到持续说话 → 模拟一次「右 Option」启动豆包免按语音；持续静音 → 再发「右 Option」结束；可选延迟后发送 Return，实现说完就发送。
+**检测到说话后，自动触发输入法的语音输入；停说后，自动结束。**
 
-- 不上传音频，不调用云端 API  
-- 音频仅用于本机电平判断  
-- 开源、可 launchd 常驻  
-
-> 作者：[@YuLin807](https://x.com/YuLin807) — 关注我的 X（推特）主页，一起交流 AI 语音输入实践。
-
-## 工作原理
+这是 [ythx-101/zhishuo](https://github.com/ythx-101/zhishuo) 的个人适配 fork。程序根据麦克风音量判断起停，并模拟输入法快捷键。**真正的语音转文字由微信输入法或豆包输入法完成**，本项目不包含语音识别模型。
 
 ```text
-┌─────────┐    CoreAudio     ┌──────────────┐
-│ DJI Mic │ ───────────────> │ RMS / VAD    │
-└─────────┘                  └──────┬───────┘
-                                   │ 持续说话 / 持续静音
-                                   v
-                         ┌─────────────────────┐
-                         │ 右 Option 单击（×2）  │
-                         └──────────┬──────────┘
-                                    v
-                         ┌─────────────────────┐
-                         │ 豆包输入法 · 免按模式  │
-                         └──────────┬──────────┘
-                                    │ 停说 + 可配置延迟
-                                    v
-                              Return（可选自动发送）
+麦克风 → 音量判断 → 按下/松开 Fn → 微信输入法转文字
 ```
 
-说明：VAD **不是**检测「拿起/放下」硬件事件，而是根据**麦克风音量**判断开始与结束。
+## 和原项目有什么区别？
 
-## 系统要求
+自动检测说话、触发输入法、静音后停止以及 launchd 常驻，**原项目已经具备**，不是本 fork 新发明的功能。
 
-- macOS 13 或更新版本  
-- Xcode Command Line Tools（提供 `swiftc`）  
-- [豆包输入法](https://www.doubao.com/)：语音设为 **免按模式**，快捷键设为 **右 Option（右 ⌥）**  
-- DJI Mic 系列接收器；默认设备名 `Wireless Mic Rx`（以系统「声音」里显示的名称为准）
+本 fork 的代码改动主要是：
 
-## 完整安装步骤
+- 新增 `--key-mode fn-hold`：说话时按住 Fn，停说后松开，适配微信输入法的长按 Fn 模式；保留原版的右 Option 点按模式。
+- 将采音从 `AVAudioEngine` 改为原生 `AVCaptureSession`，用于解决本机遇到的无音频回调问题；按设备 UID 匹配输入，不静默换用其他麦克风。
+- 新增运行时限参数 `--run-seconds SEC|unlimited`，退出时释放已按住的 Fn；Fn 模式拒绝 `--auto-enter`，不会自动回车发送。
 
-### 1. 克隆仓库
+## 使用前提
+
+- Mac、Xcode Command Line Tools，以及已启用语音输入的输入法。
+- 已连接的麦克风。本地实测组合为 DJI USB 接收器（`Wireless Mic Rx`）和微信输入法长按 Fn。
+- 在 macOS「隐私与安全」中允许运行程序使用**麦克风**和**无障碍**权限。
+- 输入法也要选择正确的麦克风，并将光标放在目标输入框。
+
+## 编译与运行
 
 ```sh
-git clone https://github.com/ythx-101/zhishuo.git
+git clone https://github.com/Juns-g/zhishuo.git
 cd zhishuo
-```
-
-### 2. 配置豆包输入法（必须先做）
-
-1. 打开 **豆包输入法设置** → 语音输入 / 语音快捷键。  
-2. 开启全局语音输入。  
-3. 选择 **「免按模式」**（点一下开始，再点一下结束）。**不要用「按住 Fn」**。  
-4. 将快捷键设为 **右 Option / 右 ⌥**。  
-5. 系统与豆包的麦克风输入尽量选 **Wireless Mic Rx**（或你的接收器名称）。  
-6. 切换到豆包输入法，把光标放在要出字的输入框里。
-
-### 3. 一键安装
-
-```sh
-./install/install.sh
-```
-
-安装器会依次：
-
-1. 编译 `task/vad-voice-trigger.swift` 并运行 `--self-test`；  
-2. 安全停掉旧服务（含历史 label `com.linyu.djimic-vad`；**bootout 失败则中止**，避免双进程）；  
-3. 将二进制与 LaunchAgent 装到固定路径（失败会回滚上一份文件）；  
-4. **默认启动** `com.zhishuo.vad`，让进程首次调用麦克风 `requestAccess`，弹出系统授权；  
-5. 再打开「麦克风 / 辅助功能」设置页，引导你**确认开关**（一般无需手动「+」添加二进制）。
-
-自定义设备名与自动回车延迟（毫秒）：
-
-```sh
-./install/install.sh \
-  --device "Wireless Mic Rx" \
-  --auto-enter-delay-ms 1200
-```
-
-只装文件、**不**加载 launchd、**不**触发麦克风系统弹窗：
-
-```sh
-./install/install.sh --no-permission-guide --no-start
-```
-
-| 选项 | 含义 |
-| --- | --- |
-| `--no-start` | 只写入二进制与 `~/Library/LaunchAgents/com.zhishuo.vad.plist`，**不** `bootout`/`bootstrap`。不会触发 TCC 麦克风弹窗；需你稍后自行 `launchctl bootstrap` 或前台运行二进制。 |
-| `--no-permission-guide` | 不打开系统设置与说明对话框；与是否启动服务无关。 |
-
-### 4. 签名（推荐，减少「重编就丢权限」）
-
-```sh
-# 查看本机可用的代码签名身份
-security find-identity -v -p codesigning
-
-./install/install.sh --sign "证书名称或 SHA-1"
-```
-
-可在「钥匙串访问 → 证书助理 → 创建证书」中创建类型为 **代码签名** 的自签名证书，再把名称传给 `--sign`。私钥只留在本机，不要提交到仓库。
-
-未指定 `--sign` 时，安装器使用 **ad-hoc 签名 + 固定安装路径 + 固定 bundle id（`com.zhishuo.vad`）**，仍比「每次在仓库里临时编译」更稳定，但升级二进制后 macOS 有时仍会要求重新授权。
-
-## 权限说明（麦克风 + 辅助功能）
-
-| 权限 | 用途 |
-| --- | --- |
-| **麦克风** | 读取 DJI 接收器音量，做本机 VAD |
-| **辅助功能** | 向系统发送右 Option / Return 键事件 |
-
-### 路径固定
-
-运行与授权对象应是安装后的程序，而不是仓库里临时编出来的副本：
-
-```text
-~/Library/Application Support/zhishuo/vad-voice-trigger
-```
-
-**推荐流程（安装器默认）：** 先 `bootstrap` 服务 → 系统弹出麦克风授权时点「好」→ 在设置页确认列表里该程序开关为开。麦克风条目通常在首次 `requestAccess` 后**自动出现**，不必依赖手动「+」。
-
-辅助功能：首次需要发键时系统也可能提示；若列表没有，再对上述固定路径点「+」。
-
-### macOS TCC 坑（按「启动者 / 身份」授权）
-
-1. **按可执行文件（及代码签名）记账**，不是按「你觉得这是哪个 App」。  
-   从 Terminal 直接跑、从 launchd 跑、从 Herdr 拉起，若路径或签名不同，系统可能当成不同主体，**反复弹权限**。  
-2. **只勾选 Terminal 不够**：launchd 启动的是上面的固定二进制，请确认 **该二进制** 在麦克风/辅助功能列表中已允许。  
-3. **改权限后**请 `bootout`/`bootstrap` 或重开服务，否则旧进程仍无权限。  
-4. **未稳定签名时重新编译**会换 CDHash，旧授权可能失效 → 用 `./install/install.sh` 装到固定路径，并尽量 `--sign`。  
-5. **`--no-start` 不会触发麦克风弹窗**——只有进程真正访问麦克风时才会。  
-
-### 日志路径与日志级别
-
-默认日志：
-
-```text
-~/Library/Logs/zhishuo.log
-```
-
-**默认只记录状态转换与错误**（如 `[VAD]` 起停、`[KEY]`、启动信息、stderr 错误）。  
-周期性电平行 `[LEVEL] … dBFS` 默认关闭；调试阈值时加 `--verbose`：
-
-```sh
-# 前台调试（含电平）
-"$HOME/Library/Application Support/zhishuo/vad-voice-trigger" \
-  --device "Wireless Mic Rx" --verbose
-
-# dry-run 调阈值时建议同时开 verbose
-./task/vad-voice-trigger --dry-run --device "Wireless Mic Rx" --verbose
-```
-
-常驻 LaunchAgent（`install.sh` 安装）**默认不带** `--verbose`，避免日志被电平刷屏。需要电平日志时，可编辑  
-`~/Library/LaunchAgents/com.zhishuo.vad.plist` 的 `ProgramArguments` 追加 `--verbose` 后重新 bootstrap。
-
-可用环境变量覆盖（安装前 export）：
-
-| 变量 | 作用 |
-| --- | --- |
-| `ZHISHUO_LOG_PATH` | 日志文件完整路径（会自动 `mkdir -p` 其父目录） |
-| `ZHISHUO_INSTALL_DIR` | 安装目录（默认 `~/Library/Application Support/zhishuo`） |
-| `ZHISHUO_DEVICE_NAME` | 默认设备名 |
-| `ZHISHUO_AUTO_ENTER_DELAY_MS` | 默认自动回车延迟 |
-| `ZHISHUO_CODESIGN_IDENTITY` | 默认签名身份 |
-
-仍兼容旧前缀 `DJIMIC_*`。
-
-## 使用说明
-
-### 日常使用
-
-1. 插上 / 唤醒 DJI 接收器，确认系统输入设备正常。  
-2. 确认 `com.zhishuo.vad` 已在运行（安装脚本默认会启动）。  
-3. 焦点放在目标输入框，用豆包输入法。  
-4. 对着 Mic **直接说话** → 自动开始转录；**停说约 0.8–1.2 秒** → 结束；默认再延迟后 **Return 发送**（由 `--auto-enter` 控制，安装默认开启）。
-
-### 服务管理
-
-```sh
-# 状态
-launchctl print gui/$(id -u)/com.zhishuo.vad
-
-# 停止
-launchctl bootout gui/$(id -u) "$HOME/Library/LaunchAgents/com.zhishuo.vad.plist"
-
-# 启动
-launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.zhishuo.vad.plist"
-
-# 日志（若设置了 ZHISHUO_LOG_PATH 则用该路径）
-tail -f "${ZHISHUO_LOG_PATH:-$HOME/Library/Logs/zhishuo.log}"
-```
-
-### 手动编译 / 调试
-
-```sh
-swiftc \
-  -framework AVFoundation \
-  -framework AVFAudio \
-  -framework CoreAudio \
-  -framework AudioToolbox \
-  -framework CoreGraphics \
-  -framework ApplicationServices \
-  task/vad-voice-trigger.swift \
-  -o task/vad-voice-trigger
+xcrun swiftc -framework AVFoundation -framework AVFAudio -framework CoreAudio \
+  -framework AudioToolbox -framework CoreMedia -framework CoreGraphics \
+  -framework ApplicationServices task/vad-voice-trigger.swift -o task/vad-voice-trigger
 
 ./task/vad-voice-trigger --self-test
 ./task/vad-voice-trigger --list-devices
-./task/vad-voice-trigger --dry-run --simulate-vad --auto-enter \
-  --auto-enter-delay-ms 1200
-./task/vad-voice-trigger --device "Wireless Mic Rx" --auto-enter
+./task/vad-voice-trigger --key-mode fn-hold --device "Wireless Mic Rx" \
+  --run-seconds unlimited --start-ms 30 --threshold-db -50 --stop-threshold-db -56
 ```
 
-调试时优先 `--dry-run`（只打印 VAD，不发真实按键）。
+阈值是本地使用参数，需要按麦克风音量与环境调整。按 `Control-C` 停止；`--help` 查看选项。无硬件模拟检查可用 `--dry-run --simulate-vad --key-mode fn-hold`，不会发真实按键。
 
-### 安装器与主程序参数对照
+这里发布的是源码，不包含本机签名的 App 或个人登录服务。上游 `install/install.sh` 仍配置右 Option／豆包工作流，并开启自动回车；**不要把它当作上述 Fn 模式的安装器**。原版完整说明保留在 [README.upstream.md](README.upstream.md)。
 
-| `install.sh` 选项 | 写入 launchd 的程序参数 | `vad-voice-trigger` CLI |
-| --- | --- | --- |
-| （固定） | 二进制路径 | — |
-| `--device NAME` | `--device NAME` | `--device NAME` |
-| （默认开启） | `--auto-enter` | `--auto-enter` |
-| `--auto-enter-delay-ms MS` | `--auto-enter-delay-ms MS` | 同左（默认 1200） |
+## 已知边界
 
-LaunchAgent Label：`com.zhishuo.vad`  
-环境变量（可选）：`ZHISHUO_INSTALL_DIR`、`ZHISHUO_LOG_PATH`、`ZHISHUO_DEVICE_NAME`、`ZHISHUO_AUTO_ENTER_DELAY_MS`、`ZHISHUO_CODESIGN_IDENTITY`（仍兼容旧前缀 `DJIMIC_*`）。
+- **开头可能丢字**：检测声音后才启动输入法，没有音频预缓冲。可先说一句短引导，再接正文；中间不要停太久，当前示例静音约一秒结束。
+- 按音量判断，不识别说话者，也不检测「拿起麦克风」；环境声音可能误触发。
+- 指定的麦克风断开后不能继续使用这一路声控，不会自动切到电脑麦克风。持续待命会持续使用麦克风。
+- 本工具不保存录音或转写内容，也不上传音频；输入法自身是否联网，以其隐私政策为准。
 
-## FAQ
+## 来源与许可
 
-### 为什么不用按键？
-
-DJI Mic 2 的按键事件经 USB 是否稳定暴露给 macOS 因型号而异；社区在 Mic Mini 上有 HID 映射方案，但本项目刻意做成 **与按键无关的声控**：只要接收器作为输入设备进系统，就能「开口即录」。作者实测方向也是「拿起直接说、停说若干秒结束」。若你更需要硬件键触发，可另接 Karabiner / hidutil 方案，与本工具可并存讨论。
-
-### 常驻听麦费电吗？
-
-- **电脑侧**：进程轻量，主要是 CoreAudio 回调做 RMS；CPU 占用通常很低。  
-- **麦克风侧**：接收器/发射器按 DJI 官方续航使用；本工具不会改变射频协议，只是电脑一直在读已打开的音频输入。  
-- 不需要时用 `launchctl bootout ...` 停掉服务即可。
-
-### 隐私：会上传音频吗？
-
-**不会。** 本仓库程序只在本机计算音量并模拟按键；**不录音文件、不联网、不调云端 ASR**。  
-真正做语音识别的是你本机已安装的 **豆包输入法**（其隐私策略以字节跳动产品说明为准）。直说本身不经手转写内容。
-
-### 为什么重新编译后又提示权限？
-
-未使用稳定证书时，新二进制 CDHash 会变。请用 `./install/install.sh` 装到固定路径，并尽量 `--sign`；授权时添加的是安装路径下的 `vad-voice-trigger`。
-
-### 找不到 `Wireless Mic Rx`？
-
-```sh
-./task/vad-voice-trigger --list-devices
-# 或
-"$HOME/Library/Application Support/zhishuo/vad-voice-trigger" --list-devices
-```
-
-用实际名称重装：
-
-```sh
-./install/install.sh --device "你在列表里看到的名字"
-```
-
-### 说完没有自动发送？
-
-- 确认输入框仍有焦点。  
-- 豆包是异步上屏，默认等 **1200ms** 再 Return；慢则加大：  
-  `./install/install.sh --auto-enter-delay-ms 1800`  
-- 日志里是否有 stop / auto-enter 记录。
-
-### 服务反复重启？
-
-`KeepAlive` 为 true。查看：
-
-```sh
-tail -50 "$HOME/Library/Logs/zhishuo.log"
-```
-
-常见原因：权限未给、设备断开、音频回调看门狗（约 1.5s 无回调）报错退出。
-
-### 如何避免误发送？
-
-自动回车会向**当前焦点**发真实 Return。先 `--dry-run` 调阈值；确认焦点在目标 App；可暂时去掉自动发送（需改 plist 去掉 `--auto-enter` 或自行改安装模板后重装）。
-
-### 从旧版 `com.linyu.djimic-vad` 升级？
-
-重新执行 `./install/install.sh` 即可：会卸载旧 Label、安装 `com.zhishuo.vad`。旧目录  
-`~/Library/Application Support/djimic-vad` 可手动删除（不再默认使用）。
-
-## 项目结构
-
-```text
-task/vad-voice-trigger.swift   主程序（VAD + 键鼠事件）
-task/hardware-listener.swift   可选：HID 硬件键探测（方案对照）
-install/install.sh             编译、签名、权限引导、launchd
-install/com.zhishuo.vad.plist  LaunchAgent 模板
-LICENSE                        MIT
-```
-
-## 致谢
-
-- **豆包输入法**（字节跳动）— 本地方便的免按语音与语义润色体验  
-- **DJI 大疆** — Mic 系列无线麦克风硬件  
-- 社区关于 Mic 电平声控、HID 映射与多 Agent 协作的讨论与实践  
-
-本项目与上述厂商无官方关联。
-
-## 免责声明
-
-本项目 **不是** DJI 或字节跳动的官方产品。键鼠模拟、自动回车与常驻服务在错误焦点下可能产生非预期输入；请在可控环境测试并自行承担风险。软件按 MIT License「按原样」提供，不作特定用途担保。
+基于 Yu Lin（ythx-101）的 [ZhiShuo](https://github.com/ythx-101/zhishuo)，保留原作者版权与 [MIT License](LICENSE)。本项目与 DJI、腾讯或字节跳动无官方关联。
